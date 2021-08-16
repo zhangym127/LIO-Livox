@@ -86,6 +86,12 @@ bool LidarFeatureExtractor::plane_judge(const std::vector<PointType>& point_list
   }
 }
 
+/**
+ * @brief 对同一条扫描线上的点进行特征提取
+ * @param cloud 输入参数，同一条扫描线上的点
+ * @param pointsLessSharp 输出参数，角点特征点云
+ * @param pointsLessFlat 输出参数，平面点特征点云
+ */
 void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& cloud,
                                                 std::vector<int>& pointsLessSharp,
                                                 std::vector<int>& pointsLessFlat){
@@ -101,6 +107,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
 
   int cloudSize = laserCloudIn->points.size();
 
+  /* 将输入点云腾挪到_laserCloud中 */
   PointType point;
   pcl::PointCloud<PointType>::Ptr _laserCloud(new pcl::PointCloud<PointType>());
   _laserCloud->reserve(cloudSize);
@@ -150,27 +157,42 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
     float diffY = 0;
     float diffZ = 0;
 
+    /* 求该点到坐标原点的距离 */
     float dis = sqrt(_laserCloud->points[i].x * _laserCloud->points[i].x +
                      _laserCloud->points[i].y * _laserCloud->points[i].y +
                      _laserCloud->points[i].z * _laserCloud->points[i].z);
 
+    /* 取当前点的相邻两点L和N */
     Eigen::Vector3d pt_last(_laserCloud->points[i-1].x, _laserCloud->points[i-1].y, _laserCloud->points[i-1].z);
     Eigen::Vector3d pt_cur(_laserCloud->points[i].x, _laserCloud->points[i].y, _laserCloud->points[i].z);
     Eigen::Vector3d pt_next(_laserCloud->points[i+1].x, _laserCloud->points[i+1].y, _laserCloud->points[i+1].z);
 
+    /* 设坐标原点是O，当前点是C，相邻两点是L和N，则分别求向量OC与CL的夹角α的余弦，向量OC与CN的夹角β的余弦 */
     double angle_last = (pt_last-pt_cur).dot(pt_cur) / ((pt_last-pt_cur).norm()*pt_cur.norm());
     double angle_next = (pt_next-pt_cur).dot(pt_cur) / ((pt_next-pt_cur).norm()*pt_cur.norm());
  
+    /* 如果距离大于100米，或者夹角α和β都小于15°。夹角α和β都小于15°说明相邻两点L和N都比C更远 */
+	/* 这里说的L和N比C更远指的是从坐标原点O算起，L和N比C更远，或者说OL和ON比OC更长 */
     if (dis > thDistanceFaraway || (fabs(angle_last) > 0.966 && fabs(angle_next) > 0.966)) {
       thNumCurvSize = 2;
     } else {
       thNumCurvSize = 3;
     }
 
+    /* 夹角α和β都小于15°，说明当前点C是角点 */
     if(fabs(angle_last) > 0.966 && fabs(angle_next) > 0.966) {
       cloudAngle[i] = 1;
     }
 
+	/* 
+	 * 求当前点的曲率： 
+	 *  -取当前点与两侧相邻4个或6个点的距离差作为曲率，距离差越大，则曲率越大。
+	 *  -如果相邻两点比当前点显著更远，则只需要取两侧5个点，否则需要7个点。
+	 *  -如果当前点距离大于100米，则只需要取两侧5个点，否则取7个点。
+	 *
+	 * 求当前点的反射率差异：
+	 *  -取当前点与两侧相邻4个或6个点反射率的总差值作为当前点的反射率特征
+	 */
     float diffR = -2 * thNumCurvSize * _laserCloud->points[i].intensity;
     for (int j = 1; j <= thNumCurvSize; ++j) {
       diffX += _laserCloud->points[i - j].x + _laserCloud->points[i + j].x;
@@ -190,10 +212,13 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
 
   }
 
+  /* 将点云以150个点为限，划分成若干个区段，然后逐一处理每个区段 */
   for (int j = 0; j < thPartNum; j++) {
+	/* sp指向点云起点，ep指向点云终点， */
     int sp = scanStartInd + (scanEndInd - scanStartInd) * j / thPartNum;
     int ep = scanStartInd + (scanEndInd - scanStartInd) * (j + 1) / thPartNum - 1;
 
+    /* 对当前区段按照曲率大小对点进行排序 */
     // sort the curvatures from small to large
     for (int k = sp + 1; k <= ep; k++) {
       for (int l = k; l >= sp + 1; l--) {
@@ -205,7 +230,8 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
         }
       }
     }
-
+	
+    /* 对当前区段按照反射率大小对点进行排序 */
     // sort the reflectivity from small to large
     for (int k = sp + 1; k <= ep; k++) {
       for (int l = k; l >= sp + 1; l--) {
@@ -218,17 +244,22 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
       }
     }
 
+	/* 提取曲率较小的点作为平面特征点，提取反射率较大的点作为角点特征点 */
+	/* 除了曲率之外，算法将＞100米的点优先添加到特征点中 */
     int smallestPickedNum = 1;
     int sharpestPickedNum = 1;
     for (int k = sp; k <= ep; k++) {
       int ind = cloudSortInd[k];
 
+      /* 仅处理那些尚未被标志的点 */
       if (CloudFeatureFlag[ind] != 0) continue;
 
       if (cloudCurvature[ind] < thFlatThreshold * cloudDepth[ind] * thFlatThreshold * cloudDepth[ind]) {
         
+		/* 将曲率小于阈值的点暂列为候选特征点 */
         CloudFeatureFlag[ind] = 3;
 
+		/* 如果当前点的相邻点与其相邻点的距离很近，并且距离小于100米，则丢弃该点 */
         for (int l = 1; l <= thNumCurvSize; l++) {
           float diffX = _laserCloud->points[ind + l].x -
                         _laserCloud->points[ind + l - 1].x;
@@ -239,7 +270,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
           if (diffX * diffX + diffY * diffY + diffZ * diffZ > 0.02 || cloudDepth[ind] > thDistanceFaraway) {
             break;
           }
-
+          /* 特征值为1，表明该点将被丢弃 */
           CloudFeatureFlag[ind + l] = 1;
         }
         for (int l = -1; l >= -thNumCurvSize; l--) {
@@ -252,24 +283,29 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
           if (diffX * diffX + diffY * diffY + diffZ * diffZ > 0.02 || cloudDepth[ind] > thDistanceFaraway) {
             break;
           }
-
+          /* 特征值为1，表明该点将被丢弃 */
           CloudFeatureFlag[ind + l] = 1;
         }
       }
     }
     
+	/* 每个区段默认只选3个平面特征点，除非该点的距离＞100米，或者该点是角点 */
     for (int k = sp; k <= ep; k++) {
       int ind = cloudSortInd[k];
       if(((CloudFeatureFlag[ind] == 3) && (smallestPickedNum <= thNumFlat)) || 
           ((CloudFeatureFlag[ind] == 3) && (cloudDepth[ind] > thDistanceFaraway)) ||
           cloudAngle[ind] == 1){
         smallestPickedNum ++;
-        CloudFeatureFlag[ind] = 2;
+        CloudFeatureFlag[ind] = 2; //特征值为2，表明该点被正式列入平面特征点
+        /* 统计特征点中距离大于100米的点数 */
         if(cloudDepth[ind] > thDistanceFaraway) {
           thDistanceFaraway_fea++;
         }
       }
-
+      
+	  /* 如果曲率低于平面点阈值的0.7倍，且反射率＞20，则给与该点300的特征值，每个区段最多不超过3个 */
+	  /* 可以认为是从曲率较低的点中提取那些反射率特别高的点，作为候选的角点特征点 */
+	  /* FIXME：特征值为300的点最后为什么没有用？ */
       int idx = reflectSortInd[k];
       if(cloudCurvature[idx] < 0.7 * thFlatThreshold * cloudDepth[idx] * thFlatThreshold * cloudDepth[idx]
          && sharpestPickedNum <= 3 && cloudReflect[idx] > 20.0){
@@ -566,12 +602,14 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
 
     if(dis < thLidarNearestDis*thLidarNearestDis) continue;
 
+	/* 仅当特征值为2时才被加入平面特征点 */
     if(CloudFeatureFlag[i] == 2){
       pointsLessFlat.push_back(i);
       num_surf++;
       continue;
     }
 
+	/* 仅当特征值为100或150时，才被加入角点特征点 */
     if(CloudFeatureFlag[i] == 100 || CloudFeatureFlag[i] == 150){ //
       pointsLessSharp_ori.push_back(i);
       laserCloudCorner->push_back(_laserCloud->points[i]);
@@ -1090,69 +1128,85 @@ void LidarFeatureExtractor::detectFeaturePoint3(pcl::PointCloud<PointType>::Ptr&
 
 }
 
-
+/**
+ * @brief 对原始点云进行特征提取
+ * @param msg 订阅的消息，包含原始点云
+ * @param laserCloud 输出参数，完整点云
+ * @param laserConerFeature 输出参数，角点特征点云
+ * @param laserSurfFeature 输出参数，平面点特征点云
+ * @param Used_Line 输入参数，使用多少个扫描线
+ */
 void LidarFeatureExtractor::FeatureExtract(const livox_ros_driver::CustomMsgConstPtr &msg,
                                            pcl::PointCloud<PointType>::Ptr& laserCloud,
                                            pcl::PointCloud<PointType>::Ptr& laserConerFeature,
                                            pcl::PointCloud<PointType>::Ptr& laserSurfFeature,
                                            const int Used_Line){
+  /* 清空缓存特征点云的各种模块变量 */
   laserCloud->clear();
   laserConerFeature->clear();
   laserSurfFeature->clear();
   laserCloud->reserve(15000*N_SCANS);
   for(auto & ptr : vlines){
-  ptr->clear();
+    ptr->clear();
   }
   for(auto & v : vcorner){
-  v.clear();
+    v.clear();
   }
   for(auto & v : vsurf){
-  v.clear();
+    v.clear();
   }
+  
+  /* 将点云转成PCL格式，并记录每个点的反射强度、时间戳、线号 */
   double timeSpan = ros::Time().fromNSec(msg->points.back().offset_time).toSec();
   PointType point;
   for(const auto& p : msg->points){
-  int line_num = (int)p.line;
-  if(line_num > Used_Line-1) continue;
-  if(p.x < 0.01) continue;
-  point.x = p.x;
-  point.y = p.y;
-  point.z = p.z;
-  point.intensity = p.reflectivity;
-  point.normal_x = ros::Time().fromNSec(p.offset_time).toSec() /timeSpan;
-  point.normal_y = _int_as_float(line_num);
-  laserCloud->push_back(point);
+    int line_num = (int)p.line;
+    if(line_num > Used_Line-1) continue;
+    if(p.x < 0.01) continue;
+    point.x = p.x;
+    point.y = p.y;
+    point.z = p.z;
+    point.intensity = p.reflectivity;
+    point.normal_x = ros::Time().fromNSec(p.offset_time).toSec() /timeSpan;
+    point.normal_y = _int_as_float(line_num);
+    laserCloud->push_back(point);
   }
+  
+  /* 将点云按线号分类保存在vlines[]中 */
   std::size_t cloud_num = laserCloud->size();
   for(std::size_t i=0; i<cloud_num; ++i){
-  int line_idx = _float_as_int(laserCloud->points[i].normal_y);
-  laserCloud->points[i].normal_z = _int_as_float(i);
-  vlines[line_idx]->push_back(laserCloud->points[i]);
-  laserCloud->points[i].normal_z = 0;
+    int line_idx = _float_as_int(laserCloud->points[i].normal_y);
+    laserCloud->points[i].normal_z = _int_as_float(i);
+    vlines[line_idx]->push_back(laserCloud->points[i]);
+    laserCloud->points[i].normal_z = 0;
   }
+  
+  /* 启动多线程进行特征提取，每个线程负责处理一条线 */
   std::thread threads[N_SCANS];
   for(int i=0; i<N_SCANS; ++i){
-  threads[i] = std::thread(&LidarFeatureExtractor::detectFeaturePoint, this, std::ref(vlines[i]),
-                     std::ref(vcorner[i]), std::ref(vsurf[i]));
+    threads[i] = std::thread(&LidarFeatureExtractor::detectFeaturePoint, this, std::ref(vlines[i]),
+					  std::ref(vcorner[i]), std::ref(vsurf[i]));
   }
+  
   for(int i=0; i<N_SCANS; ++i){
-  threads[i].join();
+    threads[i].join();
   }
+  
   for(int i=0; i<N_SCANS; ++i){
-  for(int j=0; j<vcorner[i].size(); ++j){
-  laserCloud->points[_float_as_int(vlines[i]->points[vcorner[i][j]].normal_z)].normal_z = 1.0;
-  }
-  for(int j=0; j<vsurf[i].size(); ++j){
-  laserCloud->points[_float_as_int(vlines[i]->points[vsurf[i][j]].normal_z)].normal_z = 2.0;
-  }
+    for(int j=0; j<vcorner[i].size(); ++j){
+	  laserCloud->points[_float_as_int(vlines[i]->points[vcorner[i][j]].normal_z)].normal_z = 1.0;
+    }
+    for(int j=0; j<vsurf[i].size(); ++j){
+	  laserCloud->points[_float_as_int(vlines[i]->points[vsurf[i][j]].normal_z)].normal_z = 2.0;
+    }
   }
 
   for(const auto& p : laserCloud->points){
-  if(std::fabs(p.normal_z - 1.0) < 1e-5)
-  laserConerFeature->push_back(p);
+    if(std::fabs(p.normal_z - 1.0) < 1e-5)
+	  laserConerFeature->push_back(p);
   }
   for(const auto& p : laserCloud->points){
-  if(std::fabs(p.normal_z - 2.0) < 1e-5)
-  laserSurfFeature->push_back(p);
-  }
+    if(std::fabs(p.normal_z - 2.0) < 1e-5)
+      laserSurfFeature->push_back(p);
+    }
 }
