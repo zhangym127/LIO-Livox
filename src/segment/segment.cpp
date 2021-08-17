@@ -23,6 +23,12 @@ PCSeg::~PCSeg()
     }
 }
 
+/**
+ * @brief 对点云进行分割，为每个点赋予一个类型，主要目的是区别背景和前景
+ * @param pLabel1 输出参数，点云中每个点的类型
+ * @param fPoints1 输入参数，完整点云
+ * @param pointNum 输入参数，点云点数
+ */
 int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
 {
 
