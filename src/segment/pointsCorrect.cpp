@@ -1,20 +1,33 @@
+/* 下面所有双斜杠//起头的注释都是代码原作者添加的 */
+/* 代码原作者添加的部分注释不是很明确，看的时候需要特别注意 */
+
 #include "segment/pointsCorrect.hpp"
 
 float gnd_pos[6];
 int frame_count = 0;
 int frame_lenth_threshold = 5;//5 frames update
 
+/**
+ * @brief 求指定点及其邻点的协方差矩阵，返回协方差矩阵的特征向量和特征值
+ *   搜索当前点的邻点，搜索半径是1米，搜到邻点后建立邻点的协方差矩阵，然后求特征向量和特征值
+ * @param npca 输出参数，邻点协方差矩阵的特征向量和特征值
+ * @param cloud 输入参数，完整点云
+ * @param kdtree 输入参数，基于完整点云建好的KDtree
+ * @param searchPoint 输入参数，指定点
+ * @param fSearchRadius 输入参数，搜索半径
+ */
 int GetNeiborPCA_cor(SNeiborPCA_cor &npca, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLANN<pcl::PointXYZ> kdtree, pcl::PointXYZ searchPoint, float fSearchRadius)
 {
     std::vector<float> k_dis;
     pcl::PointCloud<pcl::PointXYZ>::Ptr subCloud(new pcl::PointCloud<pcl::PointXYZ>);
 
+    /* 通过KDtree搜索指定点的邻点，半径1米 */
     if(kdtree.radiusSearch(searchPoint,fSearchRadius,npca.neibors,k_dis)>5)
     {
         subCloud->width=npca.neibors.size();
         subCloud->height=1;
         subCloud->points.resize(subCloud->width*subCloud->height);
-
+        /* 建立邻点点云 */
         for (int pid=0;pid<subCloud->points.size();pid++)//搜索半径内的地面点云 sy
         {
             subCloud->points[pid].x=cloud->points[npca.neibors[pid]].x;
@@ -42,6 +55,13 @@ int GetNeiborPCA_cor(SNeiborPCA_cor &npca, pcl::PointCloud<pcl::PointXYZ>::Ptr c
     return npca.neibors.size();
 }
 
+/**
+ * @brief 从点云中提取地面点
+ *   通过建立X-Y平面二维网格，统计每个网格的zMin、zMax和zMean的方法找出地面点
+ * @param outPoints 输出参数，地面点云
+ * @param inPoints 输入参数，完整点云
+ * @param inNum 输入参数，完整点云大小
+ */
 int FilterGndForPos_cor(float* outPoints,float*inPoints,int inNum)
 {
     int outNum=0;
@@ -52,9 +72,9 @@ int FilterGndForPos_cor(float* outPoints,float*inPoints,int inNum)
     int nx=2*x_len/dx; //80
     int ny=2*y_len/dy; //10
     float offx=-20,offy=-10;
-    float THR=0.4;
+    float THR=0.4; /* 地面网格应满足的高差阈值 */
     
-
+    /* 建立X-Y平面二维网格 */
     float *imgMinZ=(float*)calloc(nx*ny,sizeof(float));
     float *imgMaxZ=(float*)calloc(nx*ny,sizeof(float));
     float *imgSumZ=(float*)calloc(nx*ny,sizeof(float));
@@ -70,6 +90,7 @@ int FilterGndForPos_cor(float* outPoints,float*inPoints,int inNum)
         imgNumZ[ii]=0;
     }
 
+    /* 统计每个网格的zMin、zMax和zMean */
     for(int pid=0;pid<inNum;pid++)
     {
         idtemp[pid] = -1;
@@ -91,6 +112,7 @@ int FilterGndForPos_cor(float* outPoints,float*inPoints,int inNum)
             }
         }
     }
+    /* 将满足地面特征的点提取出来，放到outPoints中 */
     for(int pid=0;pid<inNum;pid++)
     {
         if (outNum >= 60000)
@@ -119,6 +141,14 @@ int FilterGndForPos_cor(float* outPoints,float*inPoints,int inNum)
     return outNum;
 }
 
+/**
+ * @brief 求地面法向量和地面中心坐标
+ *   找出点云中所有平面，并求所有平面法向量的均值，将该均值认定为地面法向量
+ * @param gnd 输出参数，
+ * @param fPoints 输入参数，完整点云
+ * @param pointNum 输入参数，点云点数
+ * @param fSearchRadius 输入参数，搜索半径
+ */
 int CalGndPos_cor(float *gnd, float *fPoints,int pointNum,float fSearchRadius)
 {
     // 初始化gnd
@@ -144,6 +174,8 @@ int CalGndPos_cor(float *gnd, float *fPoints,int pointNum,float fSearchRadius)
         cloud->points[pid].y=fPoints[pid*4+1];
         cloud->points[pid].z=fPoints[pid*4+2];
     }
+	
+	/* 建立输入点云的KDtree */
     pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
     kdtree.setInputCloud (cloud);
     int nNum=0;
@@ -158,37 +190,47 @@ int CalGndPos_cor(float *gnd, float *fPoints,int pointNum,float fSearchRadius)
             searchPoint.y=cloud->points[pid].y;
             searchPoint.z=cloud->points[pid].z;
 
+			/* 搜索当前点的邻点，搜索半径是1米，搜到邻点后建立邻点的协方差矩阵，然后求特征向量和特征值 */
+			/* 特征向量和特征值保存在npca中 */
             if(GetNeiborPCA_cor(npca,cloud,kdtree,searchPoint,fSearchRadius)>0)
             {
+                /* 将搜索到的邻点标识为已处理，避免重复统计 */
                 for(int ii=0;ii<npca.neibors.size();ii++)
                 {
                     pLabel[npca.neibors[ii]]=1;
                 }
 
+                /* 次主方向与次次方向的特征值相差巨大，说明邻点近似于面状分布 */
                 if(npca.eigenValuesPCA[1]/(npca.eigenValuesPCA[0] + 0.00001)>5000){ //指的是主方向与次方向差异较大。即这一小块接近平面 sy
-
+                        
+						/* 如果是地面，则次次方向应该是垂直向上才对 */
+						/* 垂直向上的向量，x和y值应该近似于0，z值应该为正或为负 */
+						/* eigenVectors(2,0)即次次方向的z值 */
                         if(npca.eigenVectorsPCA(2,0)>0) //垂直向上？
                         {
+							/* 累加次次方向的方向向量 */
                             gnd[0]+=npca.eigenVectorsPCA(0,0);
                             gnd[1]+=npca.eigenVectorsPCA(1,0);
                             gnd[2]+=npca.eigenVectorsPCA(2,0);
-
+                            
+                            /* 累加当前点的坐标 */
                             gnd[3]+=searchPoint.x;
                             gnd[4]+=searchPoint.y;
                             gnd[5]+=searchPoint.z;
                         }
-                        else
+                        else /* 次次方向的方向向量向下 */
                         {
+							/* 翻转方向后累加次次方向的方向向量 */
                             gnd[0]+=-npca.eigenVectorsPCA(0,0);
                             gnd[1]+=-npca.eigenVectorsPCA(1,0);
                             gnd[2]+=-npca.eigenVectorsPCA(2,0);
 
+                            /* 累加当前点的坐标 */
                             gnd[3]+=searchPoint.x;
                             gnd[4]+=searchPoint.y;
                             gnd[5]+=searchPoint.z;
                         }
                         nNum++;
-
                 }
             }
         }
@@ -196,10 +238,12 @@ int CalGndPos_cor(float *gnd, float *fPoints,int pointNum,float fSearchRadius)
     free(pLabel);
     if(nNum>0)
     {
+        /* 求均值，获得所有平面的平均法向量，近似地面的法向量，以及地面的中心 */
         for(int ii=0;ii<6;ii++)
         {
             gnd[ii]/=nNum; //平均法向量 & 地面点云的中心
         }
+        /* FIXME:下面给平均法向量的x和y值乘以一个系数是什么意思？ */
         if(abs(gnd[0])<0.1){
             gnd[0]=gnd[0]*(1-abs(gnd[0]))*4.5;
         }
@@ -283,8 +327,14 @@ int CorrectPoints_cor(float *fPoints,int pointNum,float *gndPos)
     return 0;
 }
 
-
+/**
+ * @brief 求地面法向量和地面中心坐标
+ * @param pos 输出参数，
+ * @param fPoints 输入参数，完整点云
+ * @param pointNum 输入参数，点云点数
+ */
 int GetGndPos(float *pos, float *fPoints,int pointNum){
+    /* 从输入点云中找出地面点 */
     float *fPoints3=(float*)calloc(60000*4,sizeof(float));//地面点
     int pnum3 = FilterGndForPos_cor(fPoints3,fPoints,pointNum);
     float tmpPos[6];
@@ -292,11 +342,14 @@ int GetGndPos(float *pos, float *fPoints,int pointNum){
     {
         std::cout << "too few ground points!\n";
     }
+	/* 求地面法向量和地面中心坐标 */
     int gndnum = CalGndPos_cor(tmpPos,fPoints3,pnum3,1.0);//用法向量判断，获取到法向量 & 地面搜索点，放到tmppos
+
+    /* 如果是第一次求地面法向量，直接更新模块变量gnd_pos */
     if(gnd_pos[5]==0){
         memcpy(gnd_pos,tmpPos,sizeof(tmpPos));
     }
-    else{
+    else{ /* 参考上一次地面法向量，部分更新地面法向量 */
 
         if(frame_count<frame_lenth_threshold&&tmpPos[5]!=0){
             if(gndnum>0&&abs(gnd_pos[0]-tmpPos[0])<0.1&&abs(gnd_pos[1]-tmpPos[1])<0.1){//更新法向量            

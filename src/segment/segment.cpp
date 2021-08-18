@@ -1,3 +1,7 @@
+
+/* 下面所有双斜杠//起头的注释都是代码原作者添加的 */
+/* 代码原作者添加的部分注释不是很明确，看的时候需要特别注意 */
+
 #include "segment/segment.hpp"
 
 #define N_FRAME 5
@@ -32,6 +36,9 @@ PCSeg::~PCSeg()
 int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
 {
 
+	/* 将雷达的扫描空间划分成600×200×100个网格 */
+	/* 每个网格的尺寸是40×40×20cm */
+	/* 将点云映射到这个网格空间，每个网格取一个点，进行降采样 */
     // 1 down sampling
     float *fPoints2=(float*)calloc(pointNum*4,sizeof(float));
     int *idtrans1=(int*)calloc(pointNum,sizeof(int));
@@ -43,8 +50,16 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
     }
     memset(pVImg,0,sizeof(unsigned char)*DN_SAMPLE_IMG_NX*DN_SAMPLE_IMG_NY*DN_SAMPLE_IMG_NZ);//600*200*30  
     
+	/* x是雷达光轴方向，y是水平左右方向，z是垂直方向 */
+	/* x方向取-40~200m，每40cm一格，划分成600格 */
+	/* y方向取-40~40m，每40cm一格，划分成200格 */
+	/* z方向取-2.5~17.5m，每20cm一格，划分成100格 */
+	/* 这个区间之外的点全部丢弃，不做处理 */
+	/* 将原始点云映射到网格，每个网格取一个点，实现降采样 */
+	/* 降采样后的点放在fPoints2中 */
     for(int pid=0;pid<pointNum;pid++)
     {
+		/* 求当前点在网格中的坐标 */
         int ix=(fPoints1[pid*4]+DN_SAMPLE_IMG_OFFX)/DN_SAMPLE_IMG_DX; //0-240m -> -40-190m
         int iy=(fPoints1[pid*4+1]+DN_SAMPLE_IMG_OFFY)/DN_SAMPLE_IMG_DY; //-40-40m
         int iz=(fPoints1[pid*4+2]+DN_SAMPLE_IMG_OFFZ)/DN_SAMPLE_IMG_DZ;//认为地面为-1.8？ -2.5~17.5
@@ -52,24 +67,29 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
         idtrans1[pid]=-1;
         if((ix>=0)&&(ix<DN_SAMPLE_IMG_NX)&&(iy>=0)&&(iy<DN_SAMPLE_IMG_NY)&&(iz>=0)&&(iz<DN_SAMPLE_IMG_NZ)) //DN_SAMPLE_IMG_OFFX = 0 因此只保留前半块
         {
+			/* 记录当前点在网格中的索引 */
             idtrans1[pid]=iz*DN_SAMPLE_IMG_NX*DN_SAMPLE_IMG_NY+iy*DN_SAMPLE_IMG_NX+ix; //记录这个点对应的索引
-            if(pVImg[idtrans1[pid]]==0)//没有访问过，肯定栅格内会有重复的，所以fPoints2只取第一个
+            /* 如果当前网格没有访问过 */
+			if(pVImg[idtrans1[pid]]==0)//没有访问过，肯定栅格内会有重复的，所以fPoints2只取第一个
             {
+				/* 每个网格内取一个点，放到fPoints2中，fPoints2是fPoints1的降采样 */
+				/* 每个网格内肯定有多个点，但是fPoints2只记录每个网格内的第一个点 */
                 fPoints2[pntNum*4]=fPoints1[pid*4];
                 fPoints2[pntNum*4+1]=fPoints1[pid*4+1];
                 fPoints2[pntNum*4+2]=fPoints1[pid*4+2];
                 fPoints2[pntNum*4+3]=fPoints1[pid*4+3];
-
+				/* 建立当前点的索引副本idtrans2 */
                 idtrans2[pntNum]=idtrans1[pid];
 
                 pntNum++;
             }
+			/* 标记该网格已经访问过 */
             pVImg[idtrans1[pid]]=1;
         }
-
     }
 
-    //先进行地面校正
+    /* 下面tmpPos的预设值没有任何意义，GetGndPos方法中并不使用 */ 
+	//先进行地面校正
     float tmpPos[6];
     tmpPos[0]=-0.15;
     tmpPos[1]=0;
@@ -77,12 +97,14 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
     tmpPos[3]=0;
     tmpPos[4]=0;
     tmpPos[5]=-2.04;
+    /* 求地面法向量和地面点云的中心坐标 */
     GetGndPos(tmpPos,fPoints2,pntNum); //tempPos是更新后的地面搜索点 & 平均法向量 ys
     memcpy(this->gndPos,tmpPos,6*sizeof(float));
     
     this->posFlag=1;//(this->posFlag+1)%SELF_CALI_FRAMES;
 
     // 3 点云矫正
+    /* 对点云进行变换，将地面转到以(0,0,1)为法向量的平面，并使地面高度为0 */
     this->CorrectPoints(fPoints2,pntNum,this->gndPos);
     if(this->corPoints!=NULL)
         free(this->corPoints);
@@ -91,10 +113,12 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
     memcpy(this->corPoints,fPoints2,4*pntNum*sizeof(float));
 
     // 4 粗略地面分割for地上分割
+    /* 对点云进行分割，地面点标识为1，非地面点标识为0 */
     int *pLabelGnd=(int*)calloc(pntNum,sizeof(int));
     int gnum=GndSeg(pLabelGnd,fPoints2,pntNum,1.0);
 
     // 5 地上分割
+    /* 提取非地面点，保存在fPoints3中，丢弃地面点 */
     int agnum = pntNum-gnum;
     float *fPoints3=(float*)calloc(agnum*4,sizeof(float));
     int *idtrans3=(int*)calloc(agnum,sizeof(int));
@@ -102,6 +126,7 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
     int agcnt=0;//非地面点数量
     for(int ii=0;ii<pntNum;ii++)
     {
+		/* fPoints3保存非地面点 */
         if(pLabelGnd[ii]==0) //上一步地面标记为1，非地面标记为0
         {
             fPoints3[agcnt*4]=fPoints2[ii*4];
@@ -118,6 +143,11 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
         
     }
   
+    /* 对非地面点做进一步的分割 */
+    /* 分割出背景和前景，前景进一步分割成各种目标
+     *   背景label=1 前景0
+     *   汽车、行人等运动目标，label>=10，且id唯一
+     *   电线杆、花坛、交通指示牌等目标，Label在2~6之间 */
     int *pLabelAg=(int*)calloc(agnum,sizeof(int));
     if (agnum != 0)
     {
@@ -128,7 +158,7 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
         std::cout << "0 above ground points!\n";
     }
 
-  
+    /* 分类后，背景为1，车辆等物体≥10 */
     for(int ii=0;ii<agcnt;ii++)
     {   
         if (pLabelAg[ii] >= 10)//前景为0 背景为1 物体分类后 >=10
@@ -139,9 +169,9 @@ int PCSeg::DoSeg(int *pLabel1, float* fPoints1, int pointNum)
         {
             pLabel2[idtrans3[ii]] = -1;
         }
-        
     }
-     
+    
+	/* 映射到pLabel2之后，背景为1，需要滤除的车辆等物体为200，未分类的-1 */
     for(int pid=0;pid<pntNum;pid++)
     {
         pVImg[idtrans2[pid]] = pLabel2[pid];
@@ -574,6 +604,12 @@ int GetNeiborPCA(SNeiborPCA &npca, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pc
     return npca.neibors.size();
 }
 
+/**
+ * @brief 求从向量v0变换到v1的旋转矩阵
+ * @param RTM 输出参数，旋转矩阵
+ * @param v0 输入参数，起始向量
+ * @param v1 输入参数，目标向量
+ */
 int GetRTMatrix(float *RTM, float *v0, float *v1) // v0 gndpos v1:001垂直向上
 {
     // 归一化
@@ -623,6 +659,12 @@ int GetRTMatrix(float *RTM, float *v0, float *v1) // v0 gndpos v1:001垂直向�
     return 0;
 }
 
+/**
+ * @brief 对点云进行变换，将地面转到以(0,0,1)为法向量的平面，并使地面高度为0
+ * @param fPoints 输入输出参数，完整点云
+ * @param pointNum 入参数，点云点数
+ * @param gndPos 输入参数，地面法向量和地面点云中心坐标
+ */
 int PCSeg::CorrectPoints(float *fPoints,int pointNum,float *gndPos)
 {
     float RTM[9];
@@ -630,10 +672,17 @@ int PCSeg::CorrectPoints(float *fPoints,int pointNum,float *gndPos)
     float znorm[3]={0,0,1};
     float tmp[3];
 
+    /* 求从向量gndPos变换到znorm的旋转矩阵 */
     GetRTMatrix(RTM,gndPos,znorm); // RTM 由当前地面法向量gnd，将平面转到以(0,0,1)为法向量的平面 sy
+    /* RTM矩阵的序号排列如下：
+    /* | 0 3 6 |
+    /* | 1 4 7 |
+    /* | 2 5 8 | */
 
+    /* 求变换后地面中心点的Z坐标 */
     gndHeight = RTM[2]*gndPos[3]+RTM[5]*gndPos[4]+RTM[8]*gndPos[5];
 
+    /* 对点云进行整体变换使，将地面转到以(0,0,1)为法向量的平面，并使地面高度为0 */
     for(int pid=0;pid<pointNum;pid++)
     {
         tmp[0]=RTM[0]*fPoints[pid*4]+RTM[3]*fPoints[pid*4+1]+RTM[6]*fPoints[pid*4+2];
@@ -648,6 +697,15 @@ int PCSeg::CorrectPoints(float *fPoints,int pointNum,float *gndPos)
     return 0;
 }
 
+/**
+ * @brief 对点云进行分割，区分出背景和车辆等运动目标
+ *   背景label=1 前景0
+ *   汽车、行人等运动目标，label>=10，且id唯一
+ *   电线杆、花坛、交通指示牌等目标，Label在2~6之间
+ * @param pLabel 输出参数，点云中每个点的类型
+ * @param fPoints 输入参数，地上点云，已经剔除掉地面点云
+ * @param pointNum 输入参数，点云点数
+ */
 int AbvGndSeg(int *pLabel, float *fPoints, int pointNum)
 {
     // 转换点云到pcl的格式
@@ -664,19 +722,31 @@ int AbvGndSeg(int *pLabel, float *fPoints, int pointNum)
         cloud->points[pid].z=fPoints[pid*4+2];
     }
 
-
     //调用pcl的kdtree生成方法
     pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
     kdtree.setInputCloud (cloud);
 
+    /* 进行背景和前景的分割 */
     SegBG(pLabel,cloud,kdtree,0.5); //背景label=1 前景0
 
+    /* 进行前景目标的分割 */
+    /* 对于汽车、行人等运动目标，label>=10，且id唯一 */
+    /* 对于电线杆、花坛、交通指示牌等目标，Label在2~6之间*/
     SegObjects(pLabel,cloud,kdtree,0.7);
 
+    /* 将位于背景之后的点强制标识为背景 */
     FreeSeg(fPoints,pLabel,pointNum);
     return 0;
 }
 
+/**
+ * @brief 对点云进行分割，区分出背景和前景，所谓前景是指车辆等近距离和运动目标
+ *   选取高度大于4米的点作为背景种子点，通过迭代搜索临近点的方式生长出背景点云，剩下的就是前景
+ * @param pLabel 输出参数，点云中每个点的类型，背景为1，前景为0
+ * @param cloud 输入参数，待分割点云，不包含地面
+ * @param kdtree 输入参数，待分割点云的KDtree
+ * @param fSearchRadius 输入参数，搜索半径
+ */
 int SegBG(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLANN<pcl::PointXYZ> &kdtree, float fSearchRadius)
 {
     //从较高的一些点开始从上往下增长，这样能找到一些类似树木、建筑物这样的高大背景
@@ -684,6 +754,8 @@ int SegBG(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLA
     int pnum=cloud->points.size();
     pcl::PointXYZ searchPoint;
 
+    /* 取高度4~6米之间的点作为种子点 */
+    /* 所有高度超过4米的点都被设定为背景 */
     // 初始化种子点
     std::vector<int> seeds;
     for (int pid=0;pid<pnum;pid++)
@@ -706,6 +778,7 @@ int SegBG(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLA
     // 区域增长
     while(seeds.size()>0)
     {
+        /* 以种子点为起始，搜索临近点 */
         int sid = seeds[seeds.size()-1];
         seeds.pop_back();
 
@@ -717,12 +790,13 @@ int SegBG(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLA
         else
             kdtree.radiusSearch(sid,1.5*fSearchRadius,k_inds,k_dis);
 
+        /* 将搜索到的临近点也标识为背景，并添加到种子点中，进行背景生长过程 */
         for(int ii=0;ii<k_inds.size();ii++)
         {
             if(pLabel[k_inds[ii]]==0)
             {
                 pLabel[k_inds[ii]]=1;
-                if(cloud->points[k_inds[ii]].z>0.2)//地面60cm以下不参与背景分割，以防止错误的地面点导致过度分割
+                if(cloud->points[k_inds[ii]].z>0.2)//地面20cm以下不参与背景分割，以防止错误的地面点导致过度分割
                 {
                     seeds.push_back(k_inds[ii]);
                 }
@@ -734,6 +808,18 @@ int SegBG(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLA
 
 }
 
+/**
+ * @brief 以给定的种子点为起点，通过迭代搜索临近点的方式找到属于同一个目标的点，即同属一个簇的点
+ *   并赋予一个唯一的标签ID，最后返回目标的尺寸特征
+ * @param pLabel 输出参数，点云中每个点的类型，背景为1，前景为0，前进目标＞10
+ * @param seedId 输入参数，种子点的id
+ * @param labelId 输入参数，标签ID
+ * @param cloud 输入参数，待分割点云，不包含地面
+ * @param kdtree 输入参数，待分割点云的KDtree
+ * @param fSearchRadius 输入参数，搜索半径
+ * @param thrHeight 输入参数，高度阈值，低于该阈值的点不参与分割
+ * @return 返回目标的尺寸特征，即xMin/xMax，yMin/yMax，zMin/zMax
+ */
 SClusterFeature FindACluster(int *pLabel, int seedId, int labelId, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLANN<pcl::PointXYZ> &kdtree, float fSearchRadius, float thrHeight)
 {
     // 初始化种子
@@ -803,25 +889,40 @@ SClusterFeature FindACluster(int *pLabel, int seedId, int labelId, pcl::PointClo
     return cf;
 }
 
+/**
+ * @brief 对前景点云进行分割，所谓前景是指车辆等近距离和运动目标
+ *   确定是车辆等运动前景目标的，为每个独立的目标赋予一个独立的id，且id≥10
+ *   对于尺寸特征不满足运动目标的前景点，将其类型设置为2~6的区间
+ * @param pLabel 输出参数，点云中每个点的类型，背景为1，前景为0
+ * @param cloud 输入参数，待分割点云，不包含地面
+ * @param kdtree 输入参数，待分割点云的KDtree
+ * @param fSearchRadius 输入参数，搜索半径
+ * @param 返回找到的运动目标总数，即id≥10的目标总数
+ */
 int SegObjects(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTreeFLANN<pcl::PointXYZ> &kdtree, float fSearchRadius)
 {
     int pnum=cloud->points.size();
     int labelId=10;//object编号从10开始
 
-    //遍历每个非背景点，若高度大于1则寻找一个簇，并给一个编号(>10)
+    //遍历每个非背景点，若高度大于0.4则寻找一个簇，并给一个编号(>10)
     for(int pid=0;pid<pnum;pid++)
     {
         if(pLabel[pid]==0)
         {
+            /* 每找到一个目标，赋予一个新的id，id从10开始编号 */
             if(cloud->points[pid].z>0.4)//高度阈值
             {
+                /* 对于高度超过40cm的前景点，通过迭代搜索临近点的方式找到属于同一个目标的点，实现分割 */
                 SClusterFeature cf = FindACluster(pLabel,pid,labelId,cloud,kdtree,fSearchRadius,0);
                 int isBg=0;
 
+                /* 根据目标的尺寸特征进行分类 */
                 // cluster 分类
                 float dx=cf.xmax-cf.xmin;
                 float dy=cf.ymax-cf.ymin;
                 float dz=cf.zmax-cf.zmin;
+                
+                /* 求x坐标的最小值，即最近目标 */
                 float cx=10000;
                 for(int ii=0;ii<pnum;ii++)
                 {
@@ -831,15 +932,16 @@ int SegObjects(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTr
                     }
                 }
 
+                /* 通过目标的尺寸特征排除不应该是汽车等运动目标的点 */
                 if((dx>15)||(dy>15)||((dx>10)&&(dy>10)))// 太大
                 {
                     isBg=2;
                 }
-                else if(((dx>6)||(dy>6))&&(cf.zmean < 1.5))//长而过低
+                else if(((dx>6)||(dy>6))&&(cf.zmean < 1.5))//长而过低，例如花坛
                 {
                     isBg = 3;//1;//2;
                 }
-                else if(((dx<1.5)&&(dy<1.5))&&(cf.zmax>2.5))//小而过高
+                else if(((dx<1.5)&&(dy<1.5))&&(cf.zmax>2.5))//小而过高，例如电线杆
                 {
                     isBg = 4;
                 }
@@ -847,11 +949,11 @@ int SegObjects(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTr
                 {
                     isBg=5;
                 }
-                else if((cf.zmean>3)||(cf.zmean<0.3))//太高或太低
+                else if((cf.zmean>3)||(cf.zmean<0.3))//太高或太低，例如交通指示牌
                 {
                     isBg = 6;//1;
                 }
-
+                /* 对于尺寸特征上不满足运动目标的前景点，将其类型设置为2~6的区间 */
                 if(isBg>0)
                 {
                     for(int ii=0;ii<pnum;ii++)
@@ -862,7 +964,7 @@ int SegObjects(int *pLabel, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::KdTr
                         }
                     }
                 }
-                else
+                else /* 为每个目标赋予独一无二的id */
 		        {
                     labelId++;
                 }
@@ -1009,22 +1111,34 @@ int ExpandBG(int *pLabel, float* fPoints, int pointNum, float fSearchRadius)
     return 0;
 }
 
+/**
+ * @brief 求极坐标下360度网格，每一格中最近的背景点
+ * @param pFreeDis 输出参数，待分割点云，不包含地面
+ * @param fPoints 输入参数，待分割点云，不包含地面
+ * @param pLabel 输出参数，点云中每个点的类型，背景为1，前景为0
+ * @param pointNum 输入参数，点云中的点数
+ * @return 总是返回0
+ */
 int CalFreeRegion(float *pFreeDis, float *fPoints,int *pLabel,int pointNum)
 {
     int da=FREE_DELTA_ANG;
     int thetaId;
     float dis;
 
+    /* 在极坐标下，将X-Y平面划分成360个网格，每个网格一度 */
     for(int ii=0;ii<FREE_ANG_NUM;ii++)
     {
         pFreeDis[ii]=20000;
     }
-
+    /* 找到每一度中的最近点，记录在pFreeDis中 */
     for(int pid=0;pid<pointNum;pid++)
     {
+        /* 从高度低于4.5米的背景点中找出每一度网格中的最近点 */
         if((pLabel[pid]==1)&&(fPoints[pid*4+2]<4.5))
         {
+            /* 计算弧长 */
             dis=fPoints[pid*4]*fPoints[pid*4]+fPoints[pid*4+1]*fPoints[pid*4+1];
+            /* 计算度数，以及所在网格 */
             thetaId=((atan2f(fPoints[pid*4+1],fPoints[pid*4])+FREE_PI)/FREE_DELTA_ANG);
             thetaId=thetaId%FREE_ANG_NUM;
 
@@ -1038,14 +1152,27 @@ int CalFreeRegion(float *pFreeDis, float *fPoints,int *pLabel,int pointNum)
     return 0;
 }
 
+/**
+ * @brief 将位于背景之后的点强制标识为背景
+ * @param fPoints 输入参数，待分割点云，不包含地面
+ * @param pLabel 输出参数，点云中每个点的类型，背景为1，前景为0
+ * @param pointNum 输入参数，点云中的点数
+ * @return 
+ */
 int FreeSeg(float *fPoints,int *pLabel,int pointNum)
 {
     float *pFreeDis = (float*)calloc(FREE_ANG_NUM,sizeof(float));
     int thetaId;
     float dis;
+    
+    /* FREE_ANG_NUM 360
+     * FREE_PI (3.14159265)
+     * FREE_DELTA_ANG (FREE_PI*2/FREE_ANG_NUM) */
 
+    /* 计算极坐标下360度网格，记录每一度网格中的最近背景点的距离 */
     CalFreeRegion(pFreeDis,fPoints,pLabel,pointNum);
 
+    /* 如果当前点位于背景的背后，则强制标识为背景 */
     for(int pid=0;pid<pointNum;pid++)
     {
         //! 需要考虑的是，被前景遮住的背景和被背景点遮住的前景，那个需要处理？
@@ -1064,21 +1191,38 @@ int FreeSeg(float *fPoints,int *pLabel,int pointNum)
         free(pFreeDis);
 }
 
-
+/**
+ * @brief 对点云进行地面分割，将地面点标识为1，非地面点标识为0
+ * @param fPoints 输入输出参数，完整点云
+ * @param pointNum 入参数，点云点数
+ * @param gndPos 输入参数，地面法向量和地面点云中心坐标
+ */
 int GndSeg(int* pLabel,float *fPoints,int pointNum,float fSearchRadius)
 {
     int gnum=0;
-
+    
+    /* GND_IMG_NX1 24
+     * GND_IMG_NY1 20
+     * GND_IMG_DX1 4
+     * GND_IMG_DY1 4
+     * GND_IMG_OFFX1 40
+     * GND_IMG_OFFY1 40 */
+     
+    /* x方向取-40~56m，每4m一格，划分成24格 */
+	/* y方向取-40~40m，每4m一格，划分成20格 */
+	/* 这个区间之外的点全部丢弃，不做处理 */
     // 根据BV最低点来缩小地面点搜索范围----2
     float *pGndImg1 = (float*)calloc(GND_IMG_NX1*GND_IMG_NY1,sizeof(float));
     int *tmpLabel1 = (int*)calloc(pointNum,sizeof(int));
     
+    /* 将点云映射到网格，找到每个网格的最低高度 */
     for(int ii=0;ii<GND_IMG_NX1*GND_IMG_NY1;ii++)
     {
         pGndImg1[ii]=100;
     }
     for(int pid=0;pid<pointNum;pid++)//求最低点图像
     {
+        /* 将点云中的点映射到网格中，获得网格坐标 */
         int ix= (fPoints[pid*4]+GND_IMG_OFFX1)/(GND_IMG_DX1+0.000001);
         int iy= (fPoints[pid*4+1]+GND_IMG_OFFY1)/(GND_IMG_DY1+0.000001);
         if(ix<0 || ix>=GND_IMG_NX1 || iy<0 || iy>=GND_IMG_NY1)
@@ -1087,16 +1231,18 @@ int GndSeg(int* pLabel,float *fPoints,int pointNum,float fSearchRadius)
             continue;
         }
 
+        /* 建立点的序号到网格坐标的索引 */
         int iid=ix+iy*GND_IMG_NX1;
         tmpLabel1[pid]=iid;
 
+        /* 找到每个网格的最低高度 */
         if(pGndImg1[iid]>fPoints[pid*4+2])//找最小高度
         {
             pGndImg1[iid]=fPoints[pid*4+2];
         }
-
     }
 
+    /* 每个格子中，相对于最低高度不超过0.5米的点初步标识为地面点 */
     int pnum=0;
     for(int pid=0;pid<pointNum;pid++)
     {
@@ -1117,13 +1263,16 @@ int GndSeg(int* pLabel,float *fPoints,int pointNum,float fSearchRadius)
     // 绝对高度限制
     for(int pid=0;pid<pointNum;pid++)
     {
+        /* 对于相对高度不超过0.5米的点 */
         if(pLabel[pid]==1)
         {
+            /* 剔除绝对高度超过1米的点 */
             if(fPoints[pid*4+2]>1)//for all cases 即使这个点所在格子高度差小于0.5，但绝对高度大于1，那也不行
             {
                 pLabel[pid]=0;
             }
-            else if(fPoints[pid*4]*fPoints[pid*4]+fPoints[pid*4+1]*fPoints[pid*4+1]<225)// 10m内，强制要求高度小于0.5
+            /* 在深度15米的范围内，绝对高度不能超过0.5米 */
+            else if(fPoints[pid*4]*fPoints[pid*4]+fPoints[pid*4+1]*fPoints[pid*4+1]<225)// 15m内，强制要求高度小于0.5
             {
                 if(fPoints[pid*4+2]>0.5)
                 {
@@ -1131,10 +1280,9 @@ int GndSeg(int* pLabel,float *fPoints,int pointNum,float fSearchRadius)
 
                 }
             }
-
         }
-        else
-        {
+        else /* 在深度20米的范围内，相对高度高度超过0.5米，但是绝对高度低于0.2米的也强制标识为地面 */
+        {   
             if(fPoints[pid*4]*fPoints[pid*4]+fPoints[pid*4+1]*fPoints[pid*4+1]<400)// 20m内，0.2以下强制设为地面
             {
                 if(fPoints[pid*4+2]<0.2)
@@ -1143,12 +1291,12 @@ int GndSeg(int* pLabel,float *fPoints,int pointNum,float fSearchRadius)
                 }
             }
         }
-
     }
 
     // 平面拟合与剔除
     float zMean=0;
     gnum=0;
+    /* 找到深度20米范围内的地面高度均值 */
     for(int pid=0;pid<pointNum;pid++)
     {
         if(pLabel[pid]==1 && fPoints[pid*4]*fPoints[pid*4]+fPoints[pid*4+1]*fPoints[pid*4+1]<400)
@@ -1158,6 +1306,7 @@ int GndSeg(int* pLabel,float *fPoints,int pointNum,float fSearchRadius)
         }
     }
     zMean/=(gnum+0.0001);
+    /* 剔除高出地面均值0.4米的点 */
     for(int pid=0;pid<pointNum;pid++)
     {
         if(pLabel[pid]==1)
@@ -1166,7 +1315,6 @@ int GndSeg(int* pLabel,float *fPoints,int pointNum,float fSearchRadius)
                 pLabel[pid]=0;
         }
     }
-
 
     // 个数统计
     gnum=0;
