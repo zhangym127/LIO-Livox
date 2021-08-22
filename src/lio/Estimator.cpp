@@ -4,7 +4,7 @@ Estimator::Estimator(const float& filter_corner, const float& filter_surf){
   laserCloudCornerFromLocal.reset(new pcl::PointCloud<PointType>);
   laserCloudSurfFromLocal.reset(new pcl::PointCloud<PointType>);
   laserCloudNonFeatureFromLocal.reset(new pcl::PointCloud<PointType>);
-  laserCloudCornerLast.resize(SLIDEWINDOWSIZE);
+  laserCloudCornerLast.resize(SLIDEWINDOWSIZE); //滑动窗口的Size是2
   for(auto& p:laserCloudCornerLast)
     p.reset(new pcl::PointCloud<PointType>);
   laserCloudSurfLast.resize(SLIDEWINDOWSIZE);
@@ -56,32 +56,38 @@ Estimator::~Estimator(){
   pcl::PointCloud<PointType>::Ptr laserCloudNonFeature_to_map(new pcl::PointCloud<PointType>);
   Eigen::Matrix4d transform;
   while(true){
+    /* 加锁保护点云确保点云容器的原子操作 */
     std::unique_lock<std::mutex> locker(mtx_Map);
     if(!laserCloudCornerForMap->empty()){
 
       map_update_ID ++;
 
-      map_manager->featureAssociateToMap(laserCloudCornerForMap,
-                                         laserCloudSurfForMap,
-                                         laserCloudNonFeatureForMap,
-                                         laserCloudCorner,
-                                         laserCloudSurf,
-                                         laserCloudNonFeature,
-                                         transformForMap);
+      /* 将点云转成Map坐标系 */
+      map_manager->featureAssociateToMap(laserCloudCornerForMap,    //转换前的角点
+                                         laserCloudSurfForMap,      //转换前的平面点
+                                         laserCloudNonFeatureForMap,//转换前的不规则点
+                                         laserCloudCorner,          //转换后的角点
+                                         laserCloudSurf,            //转换后的平面点
+                                         laserCloudNonFeature,      //转换后的不规则点
+                                         transformForMap);          //转换矩阵
+      /* 清空转换前的ForMap容器 */
       laserCloudCornerForMap->clear();
       laserCloudSurfForMap->clear();
       laserCloudNonFeatureForMap->clear();
       transform = transformForMap;
       locker.unlock();
-
+    
+      /* 转换后的点云添加到_to_map容器 */
       *laserCloudCorner_to_map += *laserCloudCorner;
       *laserCloudSurf_to_map += *laserCloudSurf;
       *laserCloudNonFeature_to_map += *laserCloudNonFeature;
 
+      /* 清空转换后的容器 */
       laserCloudCorner->clear();
       laserCloudSurf->clear();
       laserCloudNonFeature->clear();
 
+      /* 将新的点云添加到Map */
       if(map_update_ID % map_skip_frame == 0){
         map_manager->MapIncrement(laserCloudCorner_to_map, 
                                   laserCloudSurf_to_map, 
@@ -861,67 +867,94 @@ void Estimator::EstimateLidarPose(std::list<LidarFrame>& lidarFrameList,
   Eigen::Vector3d exPbl = -1.0 * exRbl * exTlb.topRightCorner(3,1);
   
   /* 从点云帧列表中取得最新的待优化帧的位姿 */
+  /* FIXME:取得待优化的位姿之后并没有使用？ */
   Eigen::Matrix4d transformTobeMapped = Eigen::Matrix4d::Identity();
   transformTobeMapped.topLeftCorner(3,3) = lidarFrameList.back().Q * exRbl;
   transformTobeMapped.topRightCorner(3,1) = lidarFrameList.back().Q * exPbl + lidarFrameList.back().P;
 
+  /* 取得Map中角点特征点和平面特征点的数量 */
   int laserCloudCornerFromMapNum = map_manager->get_corner_map()->points.size();
   int laserCloudSurfFromMapNum = map_manager->get_surf_map()->points.size();
+  /* 取得本地Map中角点特征点和平面特征点的数量 */
   int laserCloudCornerFromLocalNum = laserCloudCornerFromLocal->points.size();
   int laserCloudSurfFromLocalNum = laserCloudSurfFromLocal->points.size();
-  int stack_count = 0;
+
+  /* 准备待匹配特征点云，分成三类特征后存放到Stack容器中，不同的帧放在不同的层中 */
+  /* 当IMU_Mode=1时，lidarFrameList的长度＝1，Stack容器深度=1 */
+  /* 当IMU_Mode=2时，lidarFrameList的长度＞1，Stack容器深度>1 */
+  /* FIXME:Stack容器的最大深度只有2，但是lidarFrameList的最大长度似乎不止*/
+  int stack_count = 0; //Stack容器深度
   for(const auto& l : lidarFrameList){
+    /* 将点云中的角点特征点挪到laserCloudCornerLast中 */
     laserCloudCornerLast[stack_count]->clear();
     for(const auto& p : l.laserCloud->points){
       if(std::fabs(p.normal_z - 1.0) < 1e-5)
         laserCloudCornerLast[stack_count]->push_back(p);
     }
+    /* 将点云中的平面特征点挪到laserCloudSurfLast中 */
     laserCloudSurfLast[stack_count]->clear();
     for(const auto& p : l.laserCloud->points){
       if(std::fabs(p.normal_z - 2.0) < 1e-5)
         laserCloudSurfLast[stack_count]->push_back(p);
     }
-
+    /* 将点云中的不规则特征点挪到laserCloudNonFeatureLast中 */
     laserCloudNonFeatureLast[stack_count]->clear();
     for(const auto& p : l.laserCloud->points){
       if(std::fabs(p.normal_z - 3.0) < 1e-5)
         laserCloudNonFeatureLast[stack_count]->push_back(p);
     }
-
+    /* 对角点特征点进行降采样 */
     laserCloudCornerStack[stack_count]->clear();
     downSizeFilterCorner.setInputCloud(laserCloudCornerLast[stack_count]);
     downSizeFilterCorner.filter(*laserCloudCornerStack[stack_count]);
-
+    /* 对平面特征点进行降采样 */
     laserCloudSurfStack[stack_count]->clear();
     downSizeFilterSurf.setInputCloud(laserCloudSurfLast[stack_count]);
     downSizeFilterSurf.filter(*laserCloudSurfStack[stack_count]);
-
+    /* 对不规则特征点进行降采样 */
     laserCloudNonFeatureStack[stack_count]->clear();
     downSizeFilterNonFeature.setInputCloud(laserCloudNonFeatureLast[stack_count]);
     downSizeFilterNonFeature.filter(*laserCloudNonFeatureStack[stack_count]);
     stack_count++;
   }
+  
+  /* 进行位姿优化，即点云匹配 */
+  /* 匹配前确保Map以及本地Map中的特征点数量＞0 */
   if ( ((laserCloudCornerFromMapNum > 0 && laserCloudSurfFromMapNum > 100) || 
        (laserCloudCornerFromLocalNum > 0 && laserCloudSurfFromLocalNum > 100))) {
     Estimate(lidarFrameList, exTlb, gravity);
   }
 
+  /* 取得优化后的位姿变换 */
   transformTobeMapped = Eigen::Matrix4d::Identity();
   transformTobeMapped.topLeftCorner(3,3) = lidarFrameList.front().Q * exRbl;
   transformTobeMapped.topRightCorner(3,1) = lidarFrameList.front().Q * exPbl + lidarFrameList.front().P;
 
+  /* 将降采样后的特征点云添加到ForMap容器，threadMapIncrement线程会从该容器取出点云叠加到Map中 */
   std::unique_lock<std::mutex> locker(mtx_Map);
   *laserCloudCornerForMap = *laserCloudCornerStack[0];
   *laserCloudSurfForMap = *laserCloudSurfStack[0];
   *laserCloudNonFeatureForMap = *laserCloudNonFeatureStack[0];
+  /* threadMapIncrement线程用transformForMap完成点云的变换后叠加到Map */
   transformForMap = transformTobeMapped;
+  
+  /* 清空FromLocal容器，准备更新本地Map */
+  /* FromLocal容器存放了最近的若干帧完成坐标变换、叠加和降采样的特征点云，相当于本地地图 */
+  /* 与Map的匹配就是和FromLocal中的特征点云匹配 */
   laserCloudCornerFromLocal->clear();
   laserCloudSurfFromLocal->clear();
   laserCloudNonFeatureFromLocal->clear();
+  /* 生成用于点云匹配的本地Map，存放在FromLocal容器中 */
+  /* 即将最近的若干帧特征点云变换到Map坐标系，叠加在一起，降采样后存放在FromLocal容器中 */
   MapIncrementLocal(laserCloudCornerForMap,laserCloudSurfForMap,laserCloudNonFeatureForMap,transformTobeMapped);
   locker.unlock();
 }
 
+/** @brief 位姿优化
+  * @param [in] lidarFrameList: 点云帧列表
+  * @param [in] exTlb: 从Lidar坐标系到IMU坐标系的外参
+  * @param [in] gravity: 重力加速度向量
+  */
 void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                          const Eigen::Matrix4d& exTlb,
                          const Eigen::Vector3d& gravity){
@@ -930,14 +963,19 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
   int num_surf_map = 0;
 
   static uint32_t frame_count = 0;
+  /* lidarFrameList中的帧数就是窗口的Size */
   int windowSize = lidarFrameList.size();
   Eigen::Matrix4d transformTobeMapped = Eigen::Matrix4d::Identity();
+  /* 获得从IMU到Lidar坐标系的旋转和平移外参 */
   Eigen::Matrix3d exRbl = exTlb.topLeftCorner(3,3).transpose();
   Eigen::Vector3d exPbl = -1.0 * exRbl * exTlb.topRightCorner(3,1);
+
+  /* 建立本地Map的KDtree */
   kdtreeCornerFromLocal->setInputCloud(laserCloudCornerFromLocal);
   kdtreeSurfFromLocal->setInputCloud(laserCloudSurfFromLocal);
   kdtreeNonFeatureFromLocal->setInputCloud(laserCloudNonFeatureFromLocal);
 
+  /* ??? */
   std::unique_lock<std::mutex> locker3(map_manager->mtx_MapManager);
   for(int i = 0; i < 4851; i++){
     CornerKdMap[i] = map_manager->getCornerKdMap(i);
@@ -1338,6 +1376,13 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
   }
 
 }
+
+/** @brief 将特征点云变换到地图坐标系，添加到FromLocal容器
+  * @param [in] laserCloudCornerStack: 角点特征点云
+  * @param [in] laserCloudSurfStack: 平面特征点云
+  * @param [in] laserCloudNonFeatureStack: 不规则特征点云
+  * @param [in] transformTobeMapped: 变换矩阵
+  */
 void Estimator::MapIncrementLocal(const pcl::PointCloud<PointType>::Ptr& laserCloudCornerStack,
                                   const pcl::PointCloud<PointType>::Ptr& laserCloudSurfStack,
                                   const pcl::PointCloud<PointType>::Ptr& laserCloudNonFeatureStack,
@@ -1348,6 +1393,8 @@ void Estimator::MapIncrementLocal(const pcl::PointCloud<PointType>::Ptr& laserCl
   PointType pointSel;
   PointType pointSel2;
   size_t Id = localMapID % localMapWindowSize;
+  
+  /* 将特征点云变换到地图坐标系 */
   localCornerMap[Id]->clear();
   localSurfMap[Id]->clear();
   localNonFeatureMap[Id]->clear();
@@ -1363,12 +1410,13 @@ void Estimator::MapIncrementLocal(const pcl::PointCloud<PointType>::Ptr& laserCl
     MAP_MANAGER::pointAssociateToMap(&laserCloudNonFeatureStack->points[i], &pointSel2, transformTobeMapped);
     localNonFeatureMap[Id]->push_back(pointSel2);
   }
-
+  /* 将变换到Map坐标系的特征点云叠加到FromLocal容器 */
   for (int i = 0; i < localMapWindowSize; i++) {
     *laserCloudCornerFromLocal += *localCornerMap[i];
     *laserCloudSurfFromLocal += *localSurfMap[i];
     *laserCloudNonFeatureFromLocal += *localNonFeatureMap[i];
   }
+  /* 因为叠加了多帧，对FromLocal容器再次进行降采样 */
   pcl::PointCloud<PointType>::Ptr temp(new pcl::PointCloud<PointType>());
   downSizeFilterCorner.setInputCloud(laserCloudCornerFromLocal);
   downSizeFilterCorner.filter(*temp);
