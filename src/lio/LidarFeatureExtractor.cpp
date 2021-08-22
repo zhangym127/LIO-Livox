@@ -725,6 +725,7 @@ void LidarFeatureExtractor::FeatureExtract_with_segment(const livox_ros_driver::
     point.y = p.y;
     point.z = p.z;
     point.intensity = p.reflectivity;
+    /* 记录当前点时间偏移相对于点云帧时长的比值，主要用于帧内校正 */
     point.normal_x = ros::Time().fromNSec(p.offset_time).toSec() /timeSpan;
     point.normal_y = _int_as_float(line_num);
     laserCloud->push_back(point);
@@ -1278,6 +1279,7 @@ void LidarFeatureExtractor::FeatureExtract(const livox_ros_driver::CustomMsgCons
   }
   
   /* 将点云转成PCL格式，并记录每个点的反射强度、时间戳、线号 */
+  /* 获得当前点云帧的时长 */
   double timeSpan = ros::Time().fromNSec(msg->points.back().offset_time).toSec();
   PointType point;
   for(const auto& p : msg->points){
@@ -1288,6 +1290,7 @@ void LidarFeatureExtractor::FeatureExtract(const livox_ros_driver::CustomMsgCons
     point.y = p.y;
     point.z = p.z;
     point.intensity = p.reflectivity;
+    /* 记录当前点时间偏移相对于点云帧时长的比值，主要用于帧内校正 */
     point.normal_x = ros::Time().fromNSec(p.offset_time).toSec() /timeSpan;
     point.normal_y = _int_as_float(line_num);
     laserCloud->push_back(point);

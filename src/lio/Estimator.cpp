@@ -845,13 +845,22 @@ void Estimator::double2vector(std::list<LidarFrame>& lidarFrameList){
   }
 }
 
+/** @brief 位姿优化
+  * @param [in] lidarFrameList: 点云帧列表
+  * @param [in] exTlb: 从Lidar坐标系到IMU坐标系的外参
+  * @param [in] gravity: 重力加速度向量
+  * @param [in] debugInfo: 
+  */
 void Estimator::EstimateLidarPose(std::list<LidarFrame>& lidarFrameList,
                            const Eigen::Matrix4d& exTlb,
                            const Eigen::Vector3d& gravity,
                            nav_msgs::Odometry& debugInfo){
   
+  /* 获得从IMU到Lidar坐标系的旋转和平移外参 */
   Eigen::Matrix3d exRbl = exTlb.topLeftCorner(3,3).transpose();
   Eigen::Vector3d exPbl = -1.0 * exRbl * exTlb.topRightCorner(3,1);
+  
+  /* 从点云帧列表中取得最新的待优化帧的位姿 */
   Eigen::Matrix4d transformTobeMapped = Eigen::Matrix4d::Identity();
   transformTobeMapped.topLeftCorner(3,3) = lidarFrameList.back().Q * exRbl;
   transformTobeMapped.topRightCorner(3,1) = lidarFrameList.back().Q * exPbl + lidarFrameList.back().P;
