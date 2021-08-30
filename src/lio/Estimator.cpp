@@ -821,9 +821,15 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
 
 }
 
-
+/** @brief 将lidarFrameList中的位姿转存到para_PR数组中
+  *   通过对数映射将旋转四元数转成李代数
+  *   函数中通过Eigen::Map模板类PR和VBias以矩阵的方式来访问C++数组para_PR和para_VBias
+  * @param [inout] lidarFrameList 点云帧列表
+  */
 void Estimator::vector2double(const std::list<LidarFrame>& lidarFrameList){
   int i = 0;
+  /* PR和VBias是Eigen::Map类型的模板类，达到以矩阵的方式访问C++数组的效果 */
+  /* 最终的效果是将l.P和l.Q填到para_PR数组中，以矩阵的方式访问C++数组更便捷 */
   for(const auto& l : lidarFrameList){
     Eigen::Map<Eigen::Matrix<double, 6, 1>> PR(para_PR[i]);
     PR.segment<3>(0) = l.P;
@@ -1021,8 +1027,14 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
   const int max_iters = 5;
   for(int iterOpt=0; iterOpt<max_iters; ++iterOpt){
 
+    /* 将lidarFrameList中的位姿转存到para_PR和para_VBias数组中 */
+    /* para_PR中保存位置和姿态，其中姿态以李代数的形式保存 */
+    /* para_VBias中保存的是速度和偏差 */
+    /* 转存为C++数组的原因是ceres库只接受数组形式的参数 */
     vector2double(lidarFrameList);
 
+    /* 创建huber损失函数 */
+    /* FIXME:为什么windowSize等于2的时候要清空损失函数，而且还存在内存泄露的嫌疑 */
     //create huber loss function
     ceres::LossFunction* loss_function = NULL;
     loss_function = new ceres::HuberLoss(0.1 / IMUIntegrator::lidar_m);
@@ -1032,30 +1044,37 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       loss_function = new ceres::HuberLoss(0.1 / IMUIntegrator::lidar_m);
     }
 
+    /* 定义待优化的问题 */
     ceres::Problem::Options problem_options;
     ceres::Problem problem(problem_options);
 
+    /* 将位置和姿态以参数块的方式添加到优化问题 */
     for(int i=0; i<windowSize; ++i) {
       problem.AddParameterBlock(para_PR[i], 6);
     }
 
+    /* 将速度和偏差以参数块的方式添加到优化问题 */
     for(int i=0; i<windowSize; ++i)
       problem.AddParameterBlock(para_VBias[i], 9);
 
+    /* 将IMU代价函数添加到优化问题 */
     // add IMU CostFunction
     for(int f=1; f<windowSize; ++f){
       auto frame_curr = lidarFrameList.begin();
       std::advance(frame_curr, f);
+      /* Eigen::LLT表示对矩阵进行Cholesky分解，然后通过matrixL()方法获得分解后的下三角矩阵L */
+      /* 这里是对IMU预积分的协方差的逆矩阵进行Cholesky分解，然后获得L矩阵的转置 */
+      /* Cholesky分解本质上是对矩阵进行开方，下三角矩阵L即是原矩阵的平方根 */
       problem.AddResidualBlock(Cost_NavState_PRV_Bias::Create(frame_curr->imuIntegrator,
                                                               const_cast<Eigen::Vector3d&>(gravity),
                                                               Eigen::LLT<Eigen::Matrix<double, 15, 15>>
                                                                       (frame_curr->imuIntegrator.GetCovariance().inverse())
                                                                       .matrixL().transpose()),
-                               nullptr,
-                               para_PR[f-1],
-                               para_VBias[f-1],
-                               para_PR[f],
-                               para_VBias[f]);
+                               nullptr,         //损失函数为空
+                               para_PR[f-1],    //参数pri_
+                               para_VBias[f-1], //参数velobiasi_
+                               para_PR[f],      //参数prj_
+                               para_VBias[f]);  //参数velobiasj_
     }
 
     if (last_marginalization_info){

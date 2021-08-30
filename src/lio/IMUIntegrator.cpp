@@ -75,28 +75,42 @@ void IMUIntegrator::GyroIntegration(double lastTime){
   }
 }
 
+/** @brief 对IMU进行预积分
+  * @param [in] lastTime 上一帧点云的时间戳
+  * @param [in] bg 上一帧点云对应的角速度偏差
+  * @param [in] ba 上一帧点云对应的加速度偏差
+  */
 void IMUIntegrator::PreIntegration(double lastTime, const Eigen::Vector3d& bg, const Eigen::Vector3d& ba){
   Reset();
   linearized_bg = bg;
   linearized_ba = ba;
+  /* 获得第一帧IMU的起始时间戳 */
   double current_time = lastTime;
+  /* 对每一帧IMU数据 */
   for(auto & imu : vimuMsg){
+    /* 加载角速度到gyr */
     Eigen::Vector3d gyr;
     gyr <<  imu->angular_velocity.x,
             imu->angular_velocity.y,
             imu->angular_velocity.z;
+    /* 加载加速度到acc */
     Eigen::Vector3d acc;
     acc << imu->linear_acceleration.x * gnorm,
             imu->linear_acceleration.y * gnorm,
             imu->linear_acceleration.z * gnorm;
+    /* 获得当前帧对应的dt */
     double dt = imu->header.stamp.toSec() - current_time;
     if(dt <= 0 )
       ROS_WARN("dt <= 0");
+    /* gyr和acc分别减去偏差 */
     gyr -= bg;
     acc -= ba;
+    
     double dt2 = dt*dt;
+    /* 求得当前帧的姿态增量 */
     Eigen::Vector3d gyr_dt = gyr*dt;
     Eigen::Matrix3d dR = Sophus::SO3d::exp(gyr_dt).matrix();
+    /* 求右乘BCH近似雅可比，Jr中的r表示右乘 */
     Eigen::Matrix3d Jr = Eigen::Matrix3d::Identity();
     double gyr_dt_norm = gyr_dt.norm();
     if(gyr_dt_norm > 0.00001){
@@ -106,6 +120,7 @@ void IMUIntegrator::PreIntegration(double lastTime, const Eigen::Vector3d& bg, c
              - (1-cos(gyr_dt_norm))/gyr_dt_norm*K
              + (1-sin(gyr_dt_norm)/gyr_dt_norm)*K*K;
     }
+    /* 求预积分测量噪声迭代方程中的参数矩阵A和B */
     Eigen::Matrix<double,15,15> A = Eigen::Matrix<double,15,15>::Identity();
     A.block<3,3>(0,3) = -0.5*dq.matrix()*Sophus::SO3d::hat(acc)*dt2;
     A.block<3,3>(0,6) = Eigen::Matrix3d::Identity()*dt;
@@ -121,15 +136,22 @@ void IMUIntegrator::PreIntegration(double lastTime, const Eigen::Vector3d& bg, c
     B.block<3,3>(9,6) = Eigen::Matrix3d::Identity()*dt;
     B.block<3,3>(12,9) = Eigen::Matrix3d::Identity()*dt;
     jacobian = A * jacobian;
+    /* 求得预积分测量噪声的协方差矩阵 */
     covariance = A * covariance * A.transpose() + B * noise * B.transpose();
+
+    /* 下面是对dp、dv、dq的积分，与A、B无关，很容易理解 */
+    /* 更新位置增量dp：经典牛顿公式S=vt+0.5at^2 */
     dp += dv*dt + 0.5*dq.matrix()*acc*dt2;
+    /* 更新速度增量dv：加速度直接乘以dt再叠加旋转 */
     dv += dq.matrix()*acc*dt;
+    /* 更新姿态增量dq：dq直接乘以当前帧的增量dR */
     Eigen::Matrix3d m3dR = dq.matrix()*dR;
-    Eigen::Quaterniond qtmp(m3dR);
+    Eigen::Quaterniond qtmp(m3dR); //转成四元数
     if (qtmp.w()<0)
       qtmp.coeffs() *= -1;
-    dq = qtmp.normalized();
+    dq = qtmp.normalized(); //归一化
     dtime += dt;
+    /* 更新时间戳指针 */
     current_time = imu->header.stamp.toSec();
   }
 }
