@@ -75,7 +75,7 @@ void IMUIntegrator::GyroIntegration(double lastTime){
   }
 }
 
-/** @brief 对IMU进行预积分
+/** @brief 对IMU进行预积分，并求得预积分测量噪声的协方差矩阵
   * @param [in] lastTime 上一帧点云的时间戳
   * @param [in] bg 上一帧点云对应的角速度偏差
   * @param [in] ba 上一帧点云对应的加速度偏差
