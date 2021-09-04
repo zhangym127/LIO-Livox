@@ -494,7 +494,8 @@ void process(){
                     delta_Rb = dQ.toRotationMatrix();
                     delta_tb = dP;
 
-                    /* 将当前点云帧添加到点云帧列表中，并清除旧的点云帧 */
+                    /* 将当前点云帧添加到点云帧列表末尾中，并清除旧列表头端点云 */
+					/* 从IMU预积分的算法来看，队列中应该始终只有两帧点云：i和j */
                     /* 在IMU_Mode=1（即用IMU进行帧内校正）时lidarFrameList的长度为1 */
                     lidarFrameList->push_back(lidarFrame);
                     lidarFrameList->pop_front();

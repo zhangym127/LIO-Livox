@@ -340,57 +340,57 @@ struct Cost_NavState_PRV_Bias
   */
 	template <typename T>
 	bool operator()( const T *pri_, const T *velobiasi_, const T *prj_, const T *velobiasj_, T *residual) const {
-		/* 以矩阵的方式访问C++数组pri_，分别获得位置Pi和姿态Ri */
+    /* 以矩阵的方式访问C++数组pri_，分别获得位置Pi和姿态Ri */
         Eigen::Map<const Eigen::Matrix<T, 6, 1>> PRi(pri_);
 		Eigen::Matrix<T, 3, 1> Pi = PRi.template segment<3>(0);
 		Sophus::SO3<T> SO3_Ri = Sophus::SO3<T>::exp(PRi.template segment<3>(3));
-        /* 获得位置Pj和姿态Rj */
+    /* 获得位置Pj和姿态Rj */
 		Eigen::Map<const Eigen::Matrix<T, 6, 1>> PRj(prj_);
 		Eigen::Matrix<T, 3, 1> Pj = PRj.template segment<3>(0);
 		Sophus::SO3<T> SO3_Rj = Sophus::SO3<T>::exp(PRj.template segment<3>(3));
-        /* 获得速度Vi和偏差dbgi、dbai */
+    /* 获得速度Vi和偏差dbgi、dbai */
 		Eigen::Map<const Eigen::Matrix<T, 9, 1>> velobiasi(velobiasi_);
 		Eigen::Matrix<T, 3, 1> Vi = velobiasi.template segment<3>(0);
 		Eigen::Matrix<T, 3, 1> dbgi = velobiasi.template segment<3>(3) - imu_measure.GetBiasGyr().cast<T>();
 		Eigen::Matrix<T, 3, 1> dbai = velobiasi.template segment<3>(6) - imu_measure.GetBiasAcc().cast<T>();
-        /* 获得速度Vj */
+    /* 获得速度Vj */
 		Eigen::Map<const Eigen::Matrix<T, 9, 1>> velobiasj(velobiasj_);
 		Eigen::Matrix<T, 3, 1> Vj = velobiasj.template segment<3>(0);
 
 		Eigen::Map<Eigen::Matrix<T, 15, 1> > eResiduals(residual);
 		eResiduals = Eigen::Matrix<T, 15, 1>::Zero();
 
-        /* 求i、j两帧之间的dt和dt^2 */
+    /* 求i、j两帧之间的dt和dt^2 */
 		T dTij = T(imu_measure.GetDeltaTime());
 		T dT2 = dTij*dTij;
-        /* 求i、j两帧之间的位置增量dPij，速度增量dVij，姿态增量dRij */
+    /* 求i、j两帧之间的位置增量dPij，速度增量dVij，姿态增量dRij */
 		Eigen::Matrix<T, 3, 1> dPij = imu_measure.GetDeltaP().cast<T>();
 		Eigen::Matrix<T, 3, 1> dVij = imu_measure.GetDeltaV().cast<T>();
 		Sophus::SO3<T> dRij = Sophus::SO3<T>(imu_measure.GetDeltaQ().cast<T>());
 		Sophus::SO3<T> RiT = SO3_Ri.inverse();
 
-        /* 求残差第一项rPij：雷达位置增量和IMU预积分位置增量之差 */
-        /* 下面第1行求雷达位置增量 */
-        /* 下面第2、3行在IMU预积分位置增量dPij的基础上叠加角速度和加速度偏差 */
-        /* FIXME: 第一行RiT*(……)的结果似乎就是dPij，就是PoseEstimation中求第j帧lidarFrame.P的逆过程
-           然后rPij实际上就变成了两个偏差之和？ */
+    /* 求残差第一项rPij：雷达位置增量和IMU预积分位置增量之差 */
+    /* 下面第1行求雷达位置增量 */
+    /* 下面第2、3行在IMU预积分位置增量dPij的基础上叠加角速度和加速度偏差 */
+    /* FIXME: 第一行RiT*(……)的结果似乎就是dPij，就是PoseEstimation中求第j帧lidarFrame.P的逆过程
+      然后rPij实际上就变成了两个偏差之和？ */
 		Eigen::Matrix<T, 3, 1> rPij = RiT*(Pj - Pi - Vi*dTij - 0.5*GravityVec.cast<T>()*dT2) -
 						(dPij + imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_P, IMUIntegrator::O_BG).cast<T>()*dbgi +
 						imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_P, IMUIntegrator::O_BA).cast<T>()*dbai);
 
-        /* 求残差第二项rPhiij：雷达姿态增量和IMU预积分姿态增量之差*/
-        /* (RiT * SO3_Rj)即是Rj乘以Ri的逆，得到雷达的姿态增量 */
-        /* dRij是IMU预积分姿态增量，叠加偏差dR_dbg后得到IMU预积分姿态增量 */
-        /* IMU预积分姿态增量求逆，再乘以雷达的姿态增量，得到两者之差 */
-        /* 姿态增量之差通过对数映射转成李代数，即向量的形式 */
+    /* 求残差第二项rPhiij：雷达姿态增量和IMU预积分姿态增量之差*/
+    /* (RiT * SO3_Rj)即是Rj乘以Ri的逆，得到雷达的姿态增量 */
+    /* dRij是IMU预积分姿态增量，叠加偏差dR_dbg后得到IMU预积分姿态增量 */
+    /* IMU预积分姿态增量求逆，再乘以雷达的姿态增量，得到两者之差 */
+    /* 姿态增量之差通过对数映射转成李代数，即向量的形式 */
 		Sophus::SO3<T> dR_dbg = Sophus::SO3<T>::exp(
 						imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_R, IMUIntegrator::O_BG).cast<T>()*dbgi);
 		Sophus::SO3<T> rRij = (dRij * dR_dbg).inverse() * RiT * SO3_Rj;
 		Eigen::Matrix<T, 3, 1> rPhiij = rRij.log();
 
-        /* 求残差第三项rVij：雷达速度增量和IMU预积分速度增量之差 */
-        /* RiT*(……)即是PoseEstimation中求第j帧lidarFrame.V的逆过程，求得雷达的速度增量 */
-        /* 下面第2、3行在IMU预积分速度增量的基础上叠加偏差，得到IMU预积分速度增量 */
+    /* 求残差第三项rVij：雷达速度增量和IMU预积分速度增量之差 */
+    /* RiT*(……)即是PoseEstimation中求第j帧lidarFrame.V的逆过程，求得雷达的速度增量 */
+    /* 下面第2、3行在IMU预积分速度增量的基础上叠加偏差，得到IMU预积分速度增量 */
 		Eigen::Matrix<T, 3, 1> rVij = RiT*(Vj - Vi - GravityVec.cast<T>()*dTij) -
 						(dVij + imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_V, IMUIntegrator::O_BG).cast<T>()*dbgi +
 										imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_V, IMUIntegrator::O_BA).cast<T>()*dbai);
@@ -398,11 +398,13 @@ struct Cost_NavState_PRV_Bias
 		eResiduals.template segment<3>(0) = rPij;
 		eResiduals.template segment<3>(3) = rPhiij;
 		eResiduals.template segment<3>(6) = rVij;
-        /* 残差第四项：第i,j两帧的偏差之差*/
-        /* segment<6>(3)表示从velobiasj的第3个元素开始，取6个，即偏差部分 */
+    /* 残差第四项：第i,j两帧的偏差之差*/
+    /* segment<6>(3)表示从velobiasj的第3个元素开始，取6个，即偏差部分 */
 		eResiduals.template segment<6>(9) = velobiasj.template segment<6>(3) - velobiasi.template segment<6>(3);
 
-        /* 用Cholesky分解后的下三角矩阵L去左乘残差 */
+    /* FIXME:这里为什么要用信息矩阵去左乘残差不明白 */
+    /* 这里的sqrt_information就是对IMU预积分测量噪声的协方差矩阵的逆矩阵进行Cholesky分解，然后获得的L矩阵的转置 */
+    /* Cholesky分解本质上是对矩阵进行开方，下三角矩阵L即是原矩阵的平方根 */
 		eResiduals.applyOnTheLeft(sqrt_information.template cast<T>());
 
 		return true;
@@ -423,6 +425,12 @@ struct Cost_NavState_PRV_Bias
 };
 
 /** \brief Ceres Cost Funtion between PointCloud Sharp Feature and Map Cloud
+ *  @brief 角点特征点云与Map的Ceres代价函数
+ *  @param _p 角点特征点p
+ *  @param _vtx1 Map点a
+ *  @param _vtx2 Map点b
+ *  @param Tbl IMU到Lidar的外参矩阵
+ *  @param sqrt_information_ 具体的含义还不清楚，数值等于1/lidar_m 
  */
 struct Cost_NavState_IMU_Line
 {
@@ -430,7 +438,8 @@ struct Cost_NavState_IMU_Line
                            const Eigen::Matrix4d& Tbl, Eigen::Matrix<double, 1, 1>  sqrt_information_):
             point(std::move(_p)), vtx1(std::move(_vtx1)), vtx2(std::move(_vtx2)),
             sqrt_information(std::move(sqrt_information_)){
-      l12 = std::sqrt((vtx1(0) - vtx2(0))*(vtx1(0) - vtx2(0)) + (vtx1(1) - vtx2(1))*
+      /* 求a、b两点的距离 */
+	  l12 = std::sqrt((vtx1(0) - vtx2(0))*(vtx1(0) - vtx2(0)) + (vtx1(1) - vtx2(1))*
                                                                 (vtx1(1) - vtx2(1)) + (vtx1(2) - vtx2(2))*(vtx1(2) - vtx2(2)));
       Eigen::Matrix3d m3d = Tbl.topLeftCorner(3,3);
       qbl = Eigen::Quaterniond(m3d).normalized();
@@ -445,6 +454,8 @@ struct Cost_NavState_IMU_Line
       Eigen::Matrix<T, 3, 1> lpa{T(vtx1.x()), T(vtx1.y()), T(vtx1.z())};
       Eigen::Matrix<T, 3, 1> lpb{T(vtx2.x()), T(vtx2.y()), T(vtx2.z())};
 
+      /* 从添加到优化problem的参数块中取得当前点云帧的位姿估计值，对p点进行位姿变换，变换到Map坐标系 */
+      /* 和processPointToLine方法中将p点转到地图坐标系的区别是，这里用到了外参矩阵，精度更高 */
       Eigen::Map<const Eigen::Matrix<T, 6, 1>> pri_wb(PRi);
       Eigen::Quaternion<T> q_wb = Sophus::SO3<T>::exp(pri_wb.template segment<3>(3)).unit_quaternion();
       Eigen::Matrix<T, 3, 1> t_wb = pri_wb.template segment<3>(0);
@@ -452,6 +463,7 @@ struct Cost_NavState_IMU_Line
       Eigen::Matrix<T, 3, 1> t_wl = q_wb * Pbl.cast<T>() + t_wb;
       Eigen::Matrix<T, 3, 1> P_to_Map = q_wl * cp + t_wl;
 
+      /* 求线段pa和pb叉乘的结果，即pa和pb所围成的平行四边形的面积 */
       T a012 = ceres::sqrt(
               ((P_to_Map(0) - lpa(0)) * (P_to_Map(1) - lpb(1)) - (P_to_Map(0) - lpb(0)) * (P_to_Map(1) - lpa(1)))
               * ((P_to_Map(0) - lpa(0)) * (P_to_Map(1) - lpb(1)) - (P_to_Map(0) - lpb(0)) * (P_to_Map(1) - lpa(1)))
@@ -459,11 +471,18 @@ struct Cost_NavState_IMU_Line
                 * ((P_to_Map(0) - lpa(0)) * (P_to_Map(2) - lpb(2)) - (P_to_Map(0) - lpb(0)) * (P_to_Map(2) - lpa(2)))
               + ((P_to_Map(1) - lpa(1)) * (P_to_Map(2) - lpb(2)) - (P_to_Map(1) - lpb(1)) * (P_to_Map(2) - lpa(2)))
                 * ((P_to_Map(1) - lpa(1)) * (P_to_Map(2) - lpb(2)) - (P_to_Map(1) - lpb(1)) * (P_to_Map(2) - lpa(2))));
+      /* 平行四边形面积除以对角线ab的长度，就得到点p到直线ab的距离 */
       T ld2 = a012 / T(l12);
+      /* 计算p点的权重: */
+      /* p点的深度越大，权重越高，但是深度做了开方，进行了衰减*/
+      /* p点到直线ab的距离越远，权重越小 */
       T _weight = T(1) - T(0.9) * ceres::abs(ld2) / ceres::sqrt(
               ceres::sqrt( P_to_Map(0) * P_to_Map(0) +
                            P_to_Map(1) * P_to_Map(1) +
                            P_to_Map(2) * P_to_Map(2) ));
+      /* 求得残差 */
+      /* FIXME:残差为什么要乘以sqrt_information=1/lidar_m？大约是666.67 */
+      /* FIXME:lidar_m = 1.5e-3，是定义在IMUIntergrator.h文件中的常数，是什么含义？ */
       residual[0] = T(sqrt_information(0)) * _weight * ld2;
 
       return true;
@@ -543,6 +562,11 @@ struct Cost_NavState_IMU_Plan
 
 
 /** \brief Ceres Cost Funtion between PointCloud Flat Feature and Map Cloud
+ *  @brief 平面特征点云与Map点云之间的Ceres代价函数
+ *  @param _p 平面特征点p
+ *  @param _p_proj 点p在Map最近五点构成的平面上的投影点
+ *  @param Tbl IMU到Lidar的外参矩阵
+ *  @param _sqrt_information 具体的含义还不清楚，用到了SVD分解 
  */
 struct Cost_NavState_IMU_Plan_Vec
 {
@@ -563,8 +587,10 @@ struct Cost_NavState_IMU_Plan_Vec
     template <typename T>
     bool operator()(const T *PRi, T *residual) const {
       Eigen::Matrix<T, 3, 1> cp{T(point.x()), T(point.y()), T(point.z())};
-	  Eigen::Matrix<T, 3, 1> cp_proj{T(point_proj.x()), T(point_proj.y()), T(point_proj.z())};
+      Eigen::Matrix<T, 3, 1> cp_proj{T(point_proj.x()), T(point_proj.y()), T(point_proj.z())};
 
+      /* 从添加到优化problem的参数块中取得当前点云帧的位姿估计值，对p点进行位姿变换，变换到Map坐标系 */
+      /* 和processPointToLine方法中将p点转到地图坐标系的区别是，这里用到了外参矩阵，精度更高 */
       Eigen::Map<const Eigen::Matrix<T, 6, 1>> pri_wb(PRi);
       Eigen::Quaternion<T> q_wb = Sophus::SO3<T>::exp(pri_wb.template segment<3>(3)).unit_quaternion();
       Eigen::Matrix<T, 3, 1> t_wb = pri_wb.template segment<3>(0);
@@ -572,14 +598,19 @@ struct Cost_NavState_IMU_Plan_Vec
       Eigen::Matrix<T, 3, 1> t_wl = q_wb * Pbl.cast<T>() + t_wb;
       Eigen::Matrix<T, 3, 1> P_to_Map = q_wl * cp + t_wl;
 
-	  Eigen::Map<Eigen::Matrix<T, 3, 1> > eResiduals(residual);
+      /* 残差就是点p与其在Map平面投影点的差，实际上是个向量 */
+      Eigen::Map<Eigen::Matrix<T, 3, 1> > eResiduals(residual);
       eResiduals = P_to_Map - cp_proj;
-	  T _weight = T(1) - T(0.9) * (P_to_Map - cp_proj).norm() /ceres::sqrt(
+      /* 计算残差的权重 */
+      /* p点的深度越大，权重越高，但是深度做了开方，进行了衰减*/
+      /* p点到其在Map平面投影点的差越大，权重越小 */
+      T _weight = T(1) - T(0.9) * (P_to_Map - cp_proj).norm() /ceres::sqrt(
               ceres::sqrt( P_to_Map(0) * P_to_Map(0) +
                            P_to_Map(1) * P_to_Map(1) +
                            P_to_Map(2) * P_to_Map(2) ));
-	  eResiduals *= _weight;
-	  eResiduals.applyOnTheLeft(sqrt_information.template cast<T>());
+      eResiduals *= _weight;
+      /* FIXME:残差为什么要左乘信息矩阵不是很明白 */
+      eResiduals.applyOnTheLeft(sqrt_information.template cast<T>());
 
       return true;
     }
@@ -593,13 +624,21 @@ struct Cost_NavState_IMU_Plan_Vec
     }
 
     Eigen::Vector3d point;
-	Eigen::Vector3d point_proj;
+    Eigen::Vector3d point_proj;
     Eigen::Quaterniond qbl, qlb;
     Eigen::Vector3d Pbl, Plb;
-	Eigen::Matrix<double, 3, 3> sqrt_information;
+    Eigen::Matrix<double, 3, 3> sqrt_information;
 };
 
-
+/** @brief 不规则特征点云与Map的Ceres代价函数
+ *  @param _p 角点特征点p
+ *  @param _pa Map平面方程参数A
+ *  @param _pb Map平面方程参数B
+ *  @param _pb Map平面方程参数C
+ *  @param _pb Map平面方程参数D
+ *  @param Tbl IMU到Lidar的外参矩阵
+ *  @param sqrt_information_ 具体的含义还不清楚，数值等于1/lidar_m 
+ */
 struct Cost_NonFeature_ICP
 {
     Cost_NonFeature_ICP(Eigen::Vector3d  _p, double _pa, double _pb, double _pc, double _pd,
@@ -616,6 +655,8 @@ struct Cost_NonFeature_ICP
     bool operator()(const T *PRi, T *residual) const {
       Eigen::Matrix<T, 3, 1> cp{T(point.x()), T(point.y()), T(point.z())};
 
+      /* 从添加到优化problem的参数块中取得当前点云帧的位姿估计值，对p点进行位姿变换，变换到Map坐标系 */
+      /* 和processPointToLine方法中将p点转到地图坐标系的区别是，这里用到了外参矩阵，精度更高 */
       Eigen::Map<const Eigen::Matrix<T, 6, 1>> pri_wb(PRi);
       Eigen::Quaternion<T> q_wb = Sophus::SO3<T>::exp(pri_wb.template segment<3>(3)).unit_quaternion();
       Eigen::Matrix<T, 3, 1> t_wb = pri_wb.template segment<3>(0);
@@ -623,7 +664,11 @@ struct Cost_NonFeature_ICP
       Eigen::Matrix<T, 3, 1> t_wl = q_wb * Pbl.cast<T>() + t_wb;
       Eigen::Matrix<T, 3, 1> P_to_Map = q_wl * cp + t_wl;
 
+      /* 点p到平面的距离即是残差 */
       T pd2 = T(pa) * P_to_Map(0) + T(pb) * P_to_Map(1) + T(pc) * P_to_Map(2) + T(pd);
+      /* 计算残差的权重 */
+      /* p点的深度越大，权重越高，但是深度做了开方，进行了衰减*/
+      /* p点到平面的距离越大，权重越小 */
       T _weight = T(1) - T(0.9) * ceres::abs(pd2) /ceres::sqrt(
               ceres::sqrt( P_to_Map(0) * P_to_Map(0) +
                            P_to_Map(1) * P_to_Map(1) +

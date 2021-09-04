@@ -107,6 +107,15 @@ Estimator::~Estimator(){
   }
 }
 
+/** @brief 求待匹配角点特征点云中每个点到Map的距离，为每个点构造一个代价函数
+  * @param [out] edges 构造好的代价函数
+  * @param [out] vLineFeatures 线特征容器
+  * @param [in] laserCloudCorner 角点特征点云，即待匹配点云
+  * @param [in] laserCloudCornerLocal 本地Map
+  * @param [in] kdtreeLocal 用本地Map建立的KDtree
+  * @param [in] exTlb Lidar与IMU之间的外参矩阵
+  * @param [in] m4d 待匹配点云的估计位姿
+  */
 void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
                                    std::vector<FeatureLine>& vLineFeatures,
                                    const pcl::PointCloud<PointType>::Ptr& laserCloudCorner,
@@ -115,9 +124,13 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
                                    const Eigen::Matrix4d& exTlb,
                                    const Eigen::Matrix4d& m4d){
 
+  /* 求IMU到Lidar的坐标转换矩阵 */
   Eigen::Matrix4d Tbl = Eigen::Matrix4d::Identity();
   Tbl.topLeftCorner(3,3) = exTlb.topLeftCorner(3,3).transpose();
   Tbl.topRightCorner(3,1) = -1.0 * Tbl.topLeftCorner(3,3) * exTlb.topRightCorner(3,1);
+  
+  /* 如果vLineFeatures不空，直接从中取得p、a、b三个点构造代价函数 */
+  /* 免去求最近5点，求质心，求协方差矩阵，求特征向量的过程 */
   if(!vLineFeatures.empty()){
     for(const auto& l : vLineFeatures){
       auto* e = Cost_NavState_IMU_Line::Create(l.pointOri,
@@ -129,6 +142,7 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
     }
     return;
   }
+  
   PointType _pointOri, _pointSel, _coeff;
   std::vector<int> _pointSearchInd;
   std::vector<float> _pointSearchSqDis;
@@ -144,100 +158,125 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
   int debug_num2 = 0;
   int debug_num12 = 0;
   int debug_num22 = 0;
+  
   for (int i = 0; i < laserCloudCornerStackNum; i++) {
+    /* 从待匹配点云中取一个点 */
     _pointOri = laserCloudCorner->points[i];
+    /* 转到Map坐标系。注意：这里为了速度快，没有用到外参矩阵 */
     MAP_MANAGER::pointAssociateToMap(&_pointOri, &_pointSel, m4d);
+    /* 找到与该点对应的MapID */
     int id = map_manager->FindUsedCornerMap(&_pointSel,laserCenWidth_last,laserCenHeight_last,laserCenDepth_last);
 
     if(id == 5000) continue;
 
     if(std::isnan(_pointSel.x) || std::isnan(_pointSel.y) ||std::isnan(_pointSel.z)) continue;
 
+    /* 基于当前点到全局Map的距离构造残差，构造代价函数 */
+    /* 如果对应的Map规模大于100个点，则在Map中查找5个最近点，求质心，求协方差矩阵，求特征向量
+     * 然后沿主方向在质心两侧构造a、b两个点，求p到ab的距离，当p位于ab中心时残差具有最小值	*/
     if(GlobalCornerMap[id].points.size() > 100) {
       CornerKdMap[id].nearestKSearch(_pointSel, 5, _pointSearchInd, _pointSearchSqDis);
       
+      /* 确保五个点足够近 */
       if (_pointSearchSqDis[4] < thres_dist) {
 
+        /* 求五个点的质心 */
         debug_num1 ++;
-      float cx = 0;
-      float cy = 0;
-      float cz = 0;
-      for (int j = 0; j < 5; j++) {
-        cx += GlobalCornerMap[id].points[_pointSearchInd[j]].x;
-        cy += GlobalCornerMap[id].points[_pointSearchInd[j]].y;
-        cz += GlobalCornerMap[id].points[_pointSearchInd[j]].z;
+        float cx = 0;
+        float cy = 0;
+        float cz = 0;
+        for (int j = 0; j < 5; j++) {
+          cx += GlobalCornerMap[id].points[_pointSearchInd[j]].x;
+          cy += GlobalCornerMap[id].points[_pointSearchInd[j]].y;
+          cz += GlobalCornerMap[id].points[_pointSearchInd[j]].z;
+        }
+        cx /= 5;
+        cy /= 5;
+        cz /= 5;
+
+        /* 求五个点的协方差矩阵_matA1 */
+        float a11 = 0;
+        float a12 = 0;
+        float a13 = 0;
+        float a22 = 0;
+        float a23 = 0;
+        float a33 = 0;
+        for (int j = 0; j < 5; j++) {
+          float ax = GlobalCornerMap[id].points[_pointSearchInd[j]].x - cx;
+          float ay = GlobalCornerMap[id].points[_pointSearchInd[j]].y - cy;
+          float az = GlobalCornerMap[id].points[_pointSearchInd[j]].z - cz;
+
+          a11 += ax * ax;
+          a12 += ax * ay;
+          a13 += ax * az;
+          a22 += ay * ay;
+          a23 += ay * az;
+          a33 += az * az;
+        }
+        a11 /= 5;
+        a12 /= 5;
+        a13 /= 5;
+        a22 /= 5;
+        a23 /= 5;
+        a33 /= 5;
+
+        _matA1(0, 0) = a11;
+        _matA1(0, 1) = a12;
+        _matA1(0, 2) = a13;
+        _matA1(1, 0) = a12;
+        _matA1(1, 1) = a22;
+        _matA1(1, 2) = a23;
+        _matA1(2, 0) = a13;
+        _matA1(2, 1) = a23;
+        _matA1(2, 2) = a33;
+
+        /* 求协方差矩阵的特征向量和特征值 */
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(_matA1);
+        Eigen::Vector3d unit_direction = saes.eigenvectors().col(2);
+
+        /* 确保主方向远大于次主方向，即五个点呈直线排列 */
+        if (saes.eigenvalues()[2] > 3 * saes.eigenvalues()[1]) {
+          debug_num12 ++;
+          /* 沿最大特征向量方向，以质心为中心，在质心两侧构造a、b两个点 */
+          float x1 = cx + 0.1 * unit_direction[0];
+          float y1 = cy + 0.1 * unit_direction[1];
+          float z1 = cz + 0.1 * unit_direction[2];
+          float x2 = cx - 0.1 * unit_direction[0];
+          float y2 = cy - 0.1 * unit_direction[1];
+          float z2 = cz - 0.1 * unit_direction[2];
+
+          /* 将当前点p和a、b两个点加入优化序列，最优的结果是a、p、b三点一线，p在正中间 */
+          Eigen::Vector3d tripod1(x1, y1, z1);
+          Eigen::Vector3d tripod2(x2, y2, z2);
+
+          /* 构造角点特征点云到Map的代价函数 */
+          /* 点p到直线ab的距离即是残差 */
+          /* 注意下面用于构造代价函数的p点用的是原始点，而不是转换到Map坐标系的点_pointSel */
+          /* 因为_pointSel不包含IMU到Lidar的外参变换，精度不够 */
+          /* FIXME:lidar_m = 1.5e-3，是定义在IMUIntergrator.h文件中的常数，是什么含义？ */
+          auto* e = Cost_NavState_IMU_Line::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z), //点p
+                                                   tripod1, //点a
+                                                   tripod2, //点b
+                                                   Tbl,	  //外参矩阵
+                                                   // 1/lidar_m 具体的含义还不清楚
+                                                   Eigen::Matrix<double, 1, 1>(1/IMUIntegrator::lidar_m));
+          /* 保存当前代价函数到edges */
+          edges.push_back(e);
+          /* p、a、b三个点加入vLineFeatures */
+          vLineFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
+                                     tripod1,
+                                     tripod2);
+          /* 计算误差 */
+          vLineFeatures.back().ComputeError(m4d);
+
+          continue;
+        }
       }
-      cx /= 5;
-      cy /= 5;
-      cz /= 5;
-
-      float a11 = 0;
-      float a12 = 0;
-      float a13 = 0;
-      float a22 = 0;
-      float a23 = 0;
-      float a33 = 0;
-      for (int j = 0; j < 5; j++) {
-        float ax = GlobalCornerMap[id].points[_pointSearchInd[j]].x - cx;
-        float ay = GlobalCornerMap[id].points[_pointSearchInd[j]].y - cy;
-        float az = GlobalCornerMap[id].points[_pointSearchInd[j]].z - cz;
-
-        a11 += ax * ax;
-        a12 += ax * ay;
-        a13 += ax * az;
-        a22 += ay * ay;
-        a23 += ay * az;
-        a33 += az * az;
-      }
-      a11 /= 5;
-      a12 /= 5;
-      a13 /= 5;
-      a22 /= 5;
-      a23 /= 5;
-      a33 /= 5;
-
-      _matA1(0, 0) = a11;
-      _matA1(0, 1) = a12;
-      _matA1(0, 2) = a13;
-      _matA1(1, 0) = a12;
-      _matA1(1, 1) = a22;
-      _matA1(1, 2) = a23;
-      _matA1(2, 0) = a13;
-      _matA1(2, 1) = a23;
-      _matA1(2, 2) = a33;
-
-      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(_matA1);
-      Eigen::Vector3d unit_direction = saes.eigenvectors().col(2);
-
-      if (saes.eigenvalues()[2] > 3 * saes.eigenvalues()[1]) {
-        debug_num12 ++;
-        float x1 = cx + 0.1 * unit_direction[0];
-        float y1 = cy + 0.1 * unit_direction[1];
-        float z1 = cz + 0.1 * unit_direction[2];
-        float x2 = cx - 0.1 * unit_direction[0];
-        float y2 = cy - 0.1 * unit_direction[1];
-        float z2 = cz - 0.1 * unit_direction[2];
-
-        Eigen::Vector3d tripod1(x1, y1, z1);
-        Eigen::Vector3d tripod2(x2, y2, z2);
-        auto* e = Cost_NavState_IMU_Line::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                                 tripod1,
-                                                 tripod2,
-                                                 Tbl,
-                                                 Eigen::Matrix<double, 1, 1>(1/IMUIntegrator::lidar_m));
-        edges.push_back(e);
-        vLineFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                   tripod1,
-                                   tripod2);
-        vLineFeatures.back().ComputeError(m4d);
-
-        continue;
-      }
-      
     }
-    
-    }
 
+    /* 基于当前点到本地Map的距离构造残差，构造代价函数 */
+    /* 如果对应的Map规模大于20个点，则在Map中查找5个最近点，求质心，求协方差矩阵，求特征向量
+     * 然后沿主方向在质心两侧构造a、b两个点，求p到ab的距离，当p位于ab中心时残差具有最小值	*/
     if(laserCloudCornerLocal->points.size() > 20 ){
       kdtreeLocal->nearestKSearch(_pointSel, 5, _pointSearchInd2, _pointSearchSqDis2);
       if (_pointSearchSqDis2[4] < thres_dist) {
@@ -317,10 +356,11 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
         }
       }
     }
-     
   }
 }
 
+/** @brief 该函数定义了但没有任何地方使用
+  */
 void Estimator::processPointToPlan(std::vector<ceres::CostFunction *>& edges,
                                    std::vector<FeaturePlan>& vPlanFeatures,
                                    const pcl::PointCloud<PointType>::Ptr& laserCloudSurf,
@@ -429,61 +469,68 @@ void Estimator::processPointToPlan(std::vector<ceres::CostFunction *>& edges,
       }
     }
     if(laserCloudSurfLocal->points.size() > 20 ){
-    kdtreeLocal->nearestKSearch(_pointSel, 5, _pointSearchInd2, _pointSearchSqDis2);
-    if (_pointSearchSqDis2[4] < 1.0) {
-      debug_num2++;
-      for (int j = 0; j < 5; j++) { 
-        _matA0(j, 0) = laserCloudSurfLocal->points[_pointSearchInd2[j]].x;
-        _matA0(j, 1) = laserCloudSurfLocal->points[_pointSearchInd2[j]].y;
-        _matA0(j, 2) = laserCloudSurfLocal->points[_pointSearchInd2[j]].z;
-      }
-      _matX0 = _matA0.colPivHouseholderQr().solve(_matB0);
-
-      float pa = _matX0(0, 0);
-      float pb = _matX0(1, 0);
-      float pc = _matX0(2, 0);
-      float pd = 1;
-
-      float ps = std::sqrt(pa * pa + pb * pb + pc * pc);
-      pa /= ps;
-      pb /= ps;
-      pc /= ps;
-      pd /= ps;
-
-      bool planeValid = true;
-      for (int j = 0; j < 5; j++) {
-        if (std::fabs(pa * laserCloudSurfLocal->points[_pointSearchInd2[j]].x +
-                      pb * laserCloudSurfLocal->points[_pointSearchInd2[j]].y +
-                      pc * laserCloudSurfLocal->points[_pointSearchInd2[j]].z + pd) > 0.2) {
-          planeValid = false;
-          break;
+      kdtreeLocal->nearestKSearch(_pointSel, 5, _pointSearchInd2, _pointSearchSqDis2);
+      if (_pointSearchSqDis2[4] < 1.0) {
+        debug_num2++;
+        for (int j = 0; j < 5; j++) { 
+          _matA0(j, 0) = laserCloudSurfLocal->points[_pointSearchInd2[j]].x;
+          _matA0(j, 1) = laserCloudSurfLocal->points[_pointSearchInd2[j]].y;
+          _matA0(j, 2) = laserCloudSurfLocal->points[_pointSearchInd2[j]].z;
         }
-      }
+        _matX0 = _matA0.colPivHouseholderQr().solve(_matB0);
 
-      if (planeValid) {
-        debug_num22 ++;
-        auto* e = Cost_NavState_IMU_Plan::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                                pa,
-                                                pb,
-                                                pc,
-                                                pd,
-                                                Tbl,
-                                                Eigen::Matrix<double, 1, 1>(1/IMUIntegrator::lidar_m));
-        edges.push_back(e);
-        vPlanFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                  pa,
-                                  pb,
-                                  pc,
-                                  pd);
-        vPlanFeatures.back().ComputeError(m4d);
+        float pa = _matX0(0, 0);
+        float pb = _matX0(1, 0);
+        float pc = _matX0(2, 0);
+        float pd = 1;
+
+        float ps = std::sqrt(pa * pa + pb * pb + pc * pc);
+        pa /= ps;
+        pb /= ps;
+        pc /= ps;
+        pd /= ps;
+
+        bool planeValid = true;
+        for (int j = 0; j < 5; j++) {
+          if (std::fabs(pa * laserCloudSurfLocal->points[_pointSearchInd2[j]].x +
+                        pb * laserCloudSurfLocal->points[_pointSearchInd2[j]].y +
+                        pc * laserCloudSurfLocal->points[_pointSearchInd2[j]].z + pd) > 0.2) {
+            planeValid = false;
+            break;
+          }
+        }
+  
+        if (planeValid) {
+          debug_num22 ++;
+          auto* e = Cost_NavState_IMU_Plan::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
+                                                  pa,
+                                                  pb,
+                                                  pc,
+                                                  pd,
+                                                  Tbl,
+                                                  Eigen::Matrix<double, 1, 1>(1/IMUIntegrator::lidar_m));
+          edges.push_back(e);
+          vPlanFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
+                                    pa,
+                                    pb,
+                                    pc,
+                                    pd);
+          vPlanFeatures.back().ComputeError(m4d);
+        }
       }
     }
   }
-
-  }
-
 }
 
+/** @brief 求待匹配平面特征点云中每个点到Map的距离，为每个点构造一个代价函数
+  * @param [out] edges 构造好的代价函数
+  * @param [out] vPlanFeatures 平面特征容器
+  * @param [in] laserCloudSurf 平面特征点云，即待匹配点云
+  * @param [in] laserCloudSurfLocal 本地Map
+  * @param [in] kdtreeLocal 用本地Map建立的KDtree
+  * @param [in] exTlb Lidar与IMU之间的外参矩阵
+  * @param [in] m4d 待匹配点云的估计位姿
+  */
 void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
                                    std::vector<FeaturePlanVec>& vPlanFeatures,
                                    const pcl::PointCloud<PointType>::Ptr& laserCloudSurf,
@@ -494,6 +541,9 @@ void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
   Eigen::Matrix4d Tbl = Eigen::Matrix4d::Identity();
   Tbl.topLeftCorner(3,3) = exTlb.topLeftCorner(3,3).transpose();
   Tbl.topRightCorner(3,1) = -1.0 * Tbl.topLeftCorner(3,3) * exTlb.topRightCorner(3,1);
+  
+  /* 如果vLineFeatures不空，直接从中取得p、j两个点构造代价函数 */
+  /* 免去求最近5点，求平面等的过程 */
   if(!vPlanFeatures.empty()){
     for(const auto& p : vPlanFeatures){
       auto* e = Cost_NavState_IMU_Plan_Vec::Create(p.pointOri,
@@ -504,6 +554,7 @@ void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
     }
     return;
   }
+  
   PointType _pointOri, _pointSel, _coeff;
   std::vector<int> _pointSearchInd;
   std::vector<float> _pointSearchSqDis;
@@ -523,25 +574,126 @@ void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
   int debug_num2 = 0;
   int debug_num12 = 0;
   int debug_num22 = 0;
+  
   for (int i = 0; i < laserCloudSurfStackNum; i++) {
+    /* 从待匹配点云中提取一点，变换到Map坐标系 */
+    /* 注意：这里为了速度快，没有用到外参矩阵 */
     _pointOri = laserCloudSurf->points[i];
     MAP_MANAGER::pointAssociateToMap(&_pointOri, &_pointSel, m4d);
-
+    /* 找到与该点对应的MapID */
     int id = map_manager->FindUsedSurfMap(&_pointSel,laserCenWidth_last,laserCenHeight_last,laserCenDepth_last);
 
     if(id == 5000) continue;
 
     if(std::isnan(_pointSel.x) || std::isnan(_pointSel.y) ||std::isnan(_pointSel.z)) continue;
 
+    /* 基于当前点到全局Map的距离构造残差，构造代价函数 */
+    /* 如果对应的Map规模大于50个点，则在Map中查找5个最近点，求5个点所在平面
+       然后求点p在该平面上的投影点，p点到投影点的距离就是残差*/
     if(GlobalSurfMap[id].points.size() > 50) {
       SurfKdMap[id].nearestKSearch(_pointSel, 5, _pointSearchInd, _pointSearchSqDis);
 
       if (_pointSearchSqDis[4] < thres_dist) {
+		  
+        /* 求解三元一次方程组Ax=b，进行平面的法向量估计
+         * 三元一次方程Ax+By+Cz+D=0对应于空间平面，向量n=(A,B,C)是其法向量，
+         * 这里已知五个点在同一平面，且设定D为1，则一定可以找到唯一的一组法
+         * 向量n=(A,B,C)与该平面对应，调用A.colPivHouseholderQr().solve(b)
+         * 求解三元一次方程组，获得法向量n=(A,B,C)。*/
         debug_num1 ++;
         for (int j = 0; j < 5; j++) {
           _matA0(j, 0) = GlobalSurfMap[id].points[_pointSearchInd[j]].x;
           _matA0(j, 1) = GlobalSurfMap[id].points[_pointSearchInd[j]].y;
           _matA0(j, 2) = GlobalSurfMap[id].points[_pointSearchInd[j]].z;
+        }
+        _matX0 = _matA0.colPivHouseholderQr().solve(_matB0);
+
+        /* 下面用法向量检查这五个点是否构成一个严格的平面
+         * 在平面上的点p(x,y,z)一定满足方程Ax+By+Cz+1=0,如果法向量(A,B,C)的范数
+         * 是n，则方程的两边同时除以n，等式仍然成立：(A/n)x+(B/n)y+(C/n)z+1/n=0。
+         * 不满足这个等式的点不在该平面上。*/
+        float pa = _matX0(0, 0);
+        float pb = _matX0(1, 0);
+        float pc = _matX0(2, 0);
+        float pd = 1;
+
+        float ps = std::sqrt(pa * pa + pb * pb + pc * pc);
+        pa /= ps;
+        pb /= ps;
+        pc /= ps;
+        pd /= ps;
+
+        /* 计算等式(A/n)x+(B/n)y+(C/n)z+1/n的值，并检查是否≤0.2 */
+        bool planeValid = true;
+        for (int j = 0; j < 5; j++) {
+          if (std::fabs(pa * GlobalSurfMap[id].points[_pointSearchInd[j]].x +
+                        pb * GlobalSurfMap[id].points[_pointSearchInd[j]].y +
+                        pc * GlobalSurfMap[id].points[_pointSearchInd[j]].z + pd) > 0.2) {
+            planeValid = false;
+            break;
+          }
+        }
+
+        if (planeValid) {
+          
+          debug_num12 ++;
+          
+          /* 求点p在平面上的投影点point_proj */
+          /* 求点p到平面的距离dist */
+          double dist = pa * _pointSel.x +
+                        pb * _pointSel.y +
+                        pc * _pointSel.z + pd;
+          /* 构造平面单位法向量omega，(dist*omega)即从平面到点p的法向量 */
+          Eigen::Vector3d omega(pa, pb, pc);
+          /* 构造点p对应的向量Vector3d，(Vector3d-点p法向量)即是点p在平面上的投影点的向量 */
+          Eigen::Vector3d point_proj = Eigen::Vector3d(_pointSel.x,_pointSel.y,_pointSel.z) - (dist * omega);
+          
+          /* 构造信息矩阵 */
+          /* FIXME:构造左乘的信息矩阵用到了SVD分解，具体的算法原理还不是很明白 */
+          /* 构造J矩阵如下：
+           * | A B C |
+           * | 0 0 0 |
+           * | 0 0 0 | */
+          Eigen::Vector3d e1(1, 0, 0);
+          Eigen::Matrix3d J = e1 * omega.transpose();
+          /* 对矩阵J进行SVD分解：J=UΣV^T， */
+          Eigen::JacobiSVD<Eigen::Matrix3d> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
+          Eigen::Matrix3d R_svd = svd.matrixV() * svd.matrixU().transpose();
+          Eigen::Matrix3d info = (1.0/IMUIntegrator::lidar_m) * Eigen::Matrix3d::Identity();
+          info(1, 1) *= plan_weight_tan;
+          info(2, 2) *= plan_weight_tan;
+          Eigen::Matrix3d sqrt_info = info * R_svd.transpose();
+
+          /* 构造平面特征点到Map的代价函数 */
+          /* 点p与其在Map平面投影点的差就是残差 */
+          /* 注意下面用于构造代价函数的p点用的是原始点，而不是转换到Map坐标系的点_pointSel */
+          /* 因为_pointSel不包含IMU到Lidar的外参变换，精度不够 */
+          auto* e = Cost_NavState_IMU_Plan_Vec::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
+                                                       point_proj,
+                                                       Tbl,
+                                                       sqrt_info);
+          edges.push_back(e);
+          vPlanFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
+                                     point_proj,
+                                     sqrt_info);
+          vPlanFeatures.back().ComputeError(m4d);
+
+          continue;
+        }
+      }
+    }
+
+    /* 基于当前点到本地Map的距离构造残差，构造代价函数 */
+    /* 如果对应的Map规模大于20个点，则在Map中查找5个最近点，求5个点所在平面
+       然后求点p在该平面上的投影点，p点到投影点的距离就是残差*/
+    if(laserCloudSurfLocal->points.size() > 20 ){
+      kdtreeLocal->nearestKSearch(_pointSel, 5, _pointSearchInd2, _pointSearchSqDis2);
+      if (_pointSearchSqDis2[4] < thres_dist) {
+        debug_num2++;
+        for (int j = 0; j < 5; j++) { 
+          _matA0(j, 0) = laserCloudSurfLocal->points[_pointSearchInd2[j]].x;
+          _matA0(j, 1) = laserCloudSurfLocal->points[_pointSearchInd2[j]].y;
+          _matA0(j, 2) = laserCloudSurfLocal->points[_pointSearchInd2[j]].z;
         }
         _matX0 = _matA0.colPivHouseholderQr().solve(_matB0);
 
@@ -558,16 +710,16 @@ void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
 
         bool planeValid = true;
         for (int j = 0; j < 5; j++) {
-          if (std::fabs(pa * GlobalSurfMap[id].points[_pointSearchInd[j]].x +
-                        pb * GlobalSurfMap[id].points[_pointSearchInd[j]].y +
-                        pc * GlobalSurfMap[id].points[_pointSearchInd[j]].z + pd) > 0.2) {
+          if (std::fabs(pa * laserCloudSurfLocal->points[_pointSearchInd2[j]].x +
+                        pb * laserCloudSurfLocal->points[_pointSearchInd2[j]].y +
+                        pc * laserCloudSurfLocal->points[_pointSearchInd2[j]].z + pd) > 0.2) {
             planeValid = false;
             break;
           }
         }
 
         if (planeValid) {
-          debug_num12 ++;
+          debug_num22 ++;
           double dist = pa * _pointSel.x +
                         pb * _pointSel.y +
                         pc * _pointSel.z + pd;
@@ -581,90 +733,31 @@ void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
           info(1, 1) *= plan_weight_tan;
           info(2, 2) *= plan_weight_tan;
           Eigen::Matrix3d sqrt_info = info * R_svd.transpose();
-
+  
           auto* e = Cost_NavState_IMU_Plan_Vec::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                                       point_proj,
-                                                       Tbl,
-                                                       sqrt_info);
+                                                        point_proj,
+                                                        Tbl,
+                                                        sqrt_info);
           edges.push_back(e);
           vPlanFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                     point_proj,
-                                     sqrt_info);
+                                      point_proj,
+                                      sqrt_info);
           vPlanFeatures.back().ComputeError(m4d);
-
-          continue;
         }
-        
-      }
-    }
-
-
-    if(laserCloudSurfLocal->points.size() > 20 ){
-    kdtreeLocal->nearestKSearch(_pointSel, 5, _pointSearchInd2, _pointSearchSqDis2);
-    if (_pointSearchSqDis2[4] < thres_dist) {
-      debug_num2++;
-      for (int j = 0; j < 5; j++) { 
-        _matA0(j, 0) = laserCloudSurfLocal->points[_pointSearchInd2[j]].x;
-        _matA0(j, 1) = laserCloudSurfLocal->points[_pointSearchInd2[j]].y;
-        _matA0(j, 2) = laserCloudSurfLocal->points[_pointSearchInd2[j]].z;
-      }
-      _matX0 = _matA0.colPivHouseholderQr().solve(_matB0);
-
-      float pa = _matX0(0, 0);
-      float pb = _matX0(1, 0);
-      float pc = _matX0(2, 0);
-      float pd = 1;
-
-      float ps = std::sqrt(pa * pa + pb * pb + pc * pc);
-      pa /= ps;
-      pb /= ps;
-      pc /= ps;
-      pd /= ps;
-
-      bool planeValid = true;
-      for (int j = 0; j < 5; j++) {
-        if (std::fabs(pa * laserCloudSurfLocal->points[_pointSearchInd2[j]].x +
-                      pb * laserCloudSurfLocal->points[_pointSearchInd2[j]].y +
-                      pc * laserCloudSurfLocal->points[_pointSearchInd2[j]].z + pd) > 0.2) {
-          planeValid = false;
-          break;
-        }
-      }
-
-      if (planeValid) {
-        debug_num22 ++;
-        double dist = pa * _pointSel.x +
-                      pb * _pointSel.y +
-                      pc * _pointSel.z + pd;
-        Eigen::Vector3d omega(pa, pb, pc);
-        Eigen::Vector3d point_proj = Eigen::Vector3d(_pointSel.x,_pointSel.y,_pointSel.z) - (dist * omega);
-        Eigen::Vector3d e1(1, 0, 0);
-        Eigen::Matrix3d J = e1 * omega.transpose();
-        Eigen::JacobiSVD<Eigen::Matrix3d> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
-        Eigen::Matrix3d R_svd = svd.matrixV() * svd.matrixU().transpose();
-        Eigen::Matrix3d info = (1.0/IMUIntegrator::lidar_m) * Eigen::Matrix3d::Identity();
-        info(1, 1) *= plan_weight_tan;
-        info(2, 2) *= plan_weight_tan;
-        Eigen::Matrix3d sqrt_info = info * R_svd.transpose();
-
-        auto* e = Cost_NavState_IMU_Plan_Vec::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                                      point_proj,
-                                                      Tbl,
-                                                      sqrt_info);
-        edges.push_back(e);
-        vPlanFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
-                                    point_proj,
-                                    sqrt_info);
-        vPlanFeatures.back().ComputeError(m4d);
       }
     }
   }
-
-  }
-
 }
 
-
+/** @brief 求待匹配不规则特征点云中每个点到Map的距离，为每个点构造一个代价函数
+  * @param [out] edges 构造好的代价函数
+  * @param [out] vNonFeatures 不规则特征容器
+  * @param [in] laserCloudNonFeature 不规则特征点云，即待匹配点云
+  * @param [in] laserCloudNonFeatureLocal 本地Map
+  * @param [in] kdtreeLocal 用本地Map建立的KDtree
+  * @param [in] exTlb Lidar与IMU之间的外参矩阵
+  * @param [in] m4d 待匹配点云的估计位姿
+  */
 void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
                                      std::vector<FeatureNon>& vNonFeatures,
                                      const pcl::PointCloud<PointType>::Ptr& laserCloudNonFeature,
@@ -675,6 +768,9 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
   Eigen::Matrix4d Tbl = Eigen::Matrix4d::Identity();
   Tbl.topLeftCorner(3,3) = exTlb.topLeftCorner(3,3).transpose();
   Tbl.topRightCorner(3,1) = -1.0 * Tbl.topLeftCorner(3,3) * exTlb.topRightCorner(3,1);
+
+  /* 如果vNonFeatures不空，直接从中取得p、a、b、c、d五个点构造代价函数 */
+  /* 免去求最近5点，求平面等的过程 */
   if(!vNonFeatures.empty()){
     for(const auto& p : vNonFeatures){
       auto* e = Cost_NonFeature_ICP::Create(p.pointOri,
@@ -705,17 +801,29 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
 
   int laserCloudNonFeatureStackNum = laserCloudNonFeature->points.size();
   for (int i = 0; i < laserCloudNonFeatureStackNum; i++) {
+    /* 从待匹配点云中提取一点，变换到Map坐标系 */
+    /* 注意：这里为了速度快，没有用到外参矩阵 */
     _pointOri = laserCloudNonFeature->points[i];
     MAP_MANAGER::pointAssociateToMap(&_pointOri, &_pointSel, m4d);
+    /* 找到与该点对应的MapID */
     int id = map_manager->FindUsedNonFeatureMap(&_pointSel,laserCenWidth_last,laserCenHeight_last,laserCenDepth_last);
 
     if(id == 5000) continue;
 
     if(std::isnan(_pointSel.x) || std::isnan(_pointSel.y) ||std::isnan(_pointSel.z)) continue;
 
+    /* 基于当前点到全局Map的距离构造残差，构造代价函数 */
+    /* 如果对应的Map规模大于100个点，则在Map中查找5个最近点，求5个点所在平面
+       p点到平面的距离就是残差*/
     if(GlobalNonFeatureMap[id].points.size() > 100) {
       NonFeatureKdMap[id].nearestKSearch(_pointSel, 5, _pointSearchInd, _pointSearchSqDis);
       if (_pointSearchSqDis[4] < 1 * thres_dist) {
+
+        /* 求解三元一次方程组Ax=b，进行平面的法向量估计
+         * 三元一次方程Ax+By+Cz+D=0对应于空间平面，向量n=(A,B,C)是其法向量，
+         * 这里已知五个点在同一平面，且设定D为1，则一定可以找到唯一的一组法
+         * 向量n=(A,B,C)与该平面对应，调用A.colPivHouseholderQr().solve(b)
+         * 求解三元一次方程组，获得法向量n=(A,B,C)。*/
         for (int j = 0; j < 5; j++) {
           _matA0(j, 0) = GlobalNonFeatureMap[id].points[_pointSearchInd[j]].x;
           _matA0(j, 1) = GlobalNonFeatureMap[id].points[_pointSearchInd[j]].y;
@@ -723,6 +831,10 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
         }
         _matX0 = _matA0.colPivHouseholderQr().solve(_matB0);
 
+        /* 下面用法向量检查这五个点是否构成一个严格的平面
+         * 在平面上的点p(x,y,z)一定满足方程Ax+By+Cz+1=0,如果法向量(A,B,C)的范数
+         * 是n，则方程的两边同时除以n，等式仍然成立：(A/n)x+(B/n)y+(C/n)z+1/n=0。
+         * 不满足这个等式的点不在该平面上。*/    
         float pa = _matX0(0, 0);
         float pb = _matX0(1, 0);
         float pc = _matX0(2, 0);
@@ -734,6 +846,7 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
         pc /= ps;
         pd /= ps;
 
+        /* 计算等式(A/n)x+(B/n)y+(C/n)z+1/n的值，并检查是否≤0.2 */
         bool planeValid = true;
         for (int j = 0; j < 5; j++) {
           if (std::fabs(pa * GlobalNonFeatureMap[id].points[_pointSearchInd[j]].x +
@@ -746,6 +859,10 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
 
         if(planeValid) {
 
+          /* 构造不规则特征点到Map的代价函数 */
+          /* 点p到平面的距离即是残差 */
+          /* 注意下面用于构造代价函数的p点用的是原始点，而不是转换到Map坐标系的点_pointSel */
+          /* 因为_pointSel不包含IMU到Lidar的外参变换，精度不够 */
           auto* e = Cost_NonFeature_ICP::Create(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
                                                 pa,
                                                 pb,
@@ -764,9 +881,11 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
           continue;
         }
       }
-    
     }
 
+    /* 基于当前点到本地Map的距离构造残差，构造代价函数 */
+    /* 如果对应的Map规模大于20个点，则在Map中查找5个最近点，求5个点所在平面
+       p点到平面的距离就是残差*/
     if(laserCloudNonFeatureLocal->points.size() > 20 ){
       kdtreeLocal->nearestKSearch(_pointSel, 5, _pointSearchInd2, _pointSearchSqDis2);
       if (_pointSearchSqDis2[4] < 1 * thres_dist) {
@@ -818,7 +937,6 @@ void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
       }
     }
   }
-
 }
 
 /** @brief 将lidarFrameList中的位姿转存到para_PR数组中
@@ -843,6 +961,11 @@ void Estimator::vector2double(const std::list<LidarFrame>& lidarFrameList){
   }
 }
 
+/** @brief 将para_PR数组中的位姿转存到lidarFrameList中
+  *   通过指数映射将李代数转成旋转四元数
+  *   函数中通过Eigen::Map模板类PR和VBias以矩阵的方式来访问C++数组para_PR和para_VBias
+  * @param [inout] lidarFrameList 点云帧列表
+  */
 void Estimator::double2vector(std::list<LidarFrame>& lidarFrameList){
   int i = 0;
   for(auto& l : lidarFrameList){
@@ -957,6 +1080,17 @@ void Estimator::EstimateLidarPose(std::list<LidarFrame>& lidarFrameList,
 }
 
 /** @brief 位姿优化
+  *   每次优化使用两帧点云，分别是i和j
+  *   优化的状态变量有六个：Pi，Vi，Ri，Pj，Vj，Rj，δbg，δba
+  *   首先对i和j之间的IMU数据进行预积，获得第j帧的位姿估计值，同时获得i、j之间的预积分
+  *   将预积分代价函数添加到优化问题，以实现对偏差δbg，δba的优化
+  *   将上一轮的边缘优化添加到优化问题，以获得该帧更高精度的位姿
+  *   将第i和第j帧特征点云到Map的Ceres代价函数添加到优化问题，以实现对位姿Pi，Vi，Ri，Pj，Vj，Rj的优化
+  *     -角点特征点使用点p到直线ab的距离作为残差
+  *     -平面特征点使用点p到平面投影点的距离作为残差
+  *     -不规则特征点使用点p到平面的距离作为残差
+  *     -在残差的后处理上使用了信息矩阵，具体的原理还不是很清楚
+  *   优化完成后将第i帧的状态变量以及代价函数添加到边缘优化，参与下一轮的优化
   * @param [in] lidarFrameList: 点云帧列表
   * @param [in] exTlb: 从Lidar坐标系到IMU坐标系的外参
   * @param [in] gravity: 重力加速度向量
@@ -969,7 +1103,8 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
   int num_surf_map = 0;
 
   static uint32_t frame_count = 0;
-  /* lidarFrameList中的帧数就是窗口的Size */
+  /* lidarFrameList中的帧数就是窗口的Size，从上下文来看为2的可能性较大 */
+  /* 这里应用了IMU预积分算法，IMU预积分的残差每次需要用到两帧点云对应位姿，分别称作第i和第j帧 */
   int windowSize = lidarFrameList.size();
   Eigen::Matrix4d transformTobeMapped = Eigen::Matrix4d::Identity();
   /* 获得从IMU到Lidar坐标系的旋转和平移外参 */
@@ -1027,6 +1162,8 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
   const int max_iters = 5;
   for(int iterOpt=0; iterOpt<max_iters; ++iterOpt){
 
+    /* 准备待优化的状态变量初始值 */
+    /* 待优化的状态变量保存在para_PR和para_VBias数组中 */
     /* 将lidarFrameList中的位姿转存到para_PR和para_VBias数组中 */
     /* para_PR中保存位置和姿态，其中姿态以李代数的形式保存 */
     /* para_VBias中保存的是速度和偏差 */
@@ -1057,13 +1194,17 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     for(int i=0; i<windowSize; ++i)
       problem.AddParameterBlock(para_VBias[i], 9);
 
-    /* 将IMU代价函数添加到优化问题 */
+    /* 将IMU预积分相关的残差添加到优化问题 */
+    /* 注意这里只添加第j帧一帧的IMU预积分代价函数到优化问题 */
+    /* IMU预积分是从i到j之间所有数据的预积分，因此只需要添加一帧即可 */
     // add IMU CostFunction
     for(int f=1; f<windowSize; ++f){
+      /* 取得指向第一帧的迭代器 */
       auto frame_curr = lidarFrameList.begin();
+      /* 设置迭代指针指向第2帧，即IMU预积分中的第j帧 */
       std::advance(frame_curr, f);
       /* Eigen::LLT表示对矩阵进行Cholesky分解，然后通过matrixL()方法获得分解后的下三角矩阵L */
-      /* 这里是对IMU预积分的协方差的逆矩阵进行Cholesky分解，然后获得L矩阵的转置 */
+      /* 这里是对IMU预积分测量噪声的协方差矩阵的逆矩阵进行Cholesky分解，然后获得L矩阵的转置 */
       /* Cholesky分解本质上是对矩阵进行开方，下三角矩阵L即是原矩阵的平方根 */
       problem.AddResidualBlock(Cost_NavState_PRV_Bias::Create(frame_curr->imuIntegrator,
                                                               const_cast<Eigen::Vector3d&>(gravity),
@@ -1077,6 +1218,10 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                para_VBias[f]);  //参数velobiasj_
     }
 
+    /* 进行边缘优化 */
+    /* 每一轮都有两帧点云参与优化，分别是i和j */
+    /* 将上一轮中的第i帧对应的状态变量及其代价函数加入到当前帧的优化问题中进行同步优化，以获得更高精度 */
+    /* 因此实际上每一轮都有三帧点云参与优化 */
     if (last_marginalization_info){
       // construct new marginlization_factor
       auto *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
@@ -1084,20 +1229,29 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                last_marginalization_parameter_blocks);
     }
 
+    /* 取得第j帧的姿态q和位置t */
     Eigen::Quaterniond q_before_opti = lidarFrameList.back().Q;
     Eigen::Vector3d t_before_opti = lidarFrameList.back().P;
 
+    /* 定义存放代价函数的的容器 */
     std::vector<std::vector<ceres::CostFunction *>> edgesLine(windowSize);
     std::vector<std::vector<ceres::CostFunction *>> edgesPlan(windowSize);
     std::vector<std::vector<ceres::CostFunction *>> edgesNon(windowSize);
+    
+    /* 为点云列表lidarFrameList中的每一帧点云构造代价函数 */
     std::thread threads[3];
     for(int f=0; f<windowSize; ++f) {
+      /* 取得指向点云列表第一个元素的迭代器 */
       auto frame_curr = lidarFrameList.begin();
+      /* 取得点云列表中的第f个元素 */
+      /* advance是迭代器辅助函数，配合for循环中的f变量自增，实现对点云列表的遍历 */
       std::advance(frame_curr, f);
+      /* 将第f帧点云的姿态Q和位置P从IMU坐标系转成Lidar坐标系 */
       transformTobeMapped = Eigen::Matrix4d::Identity();
       transformTobeMapped.topLeftCorner(3,3) = frame_curr->Q * exRbl;
       transformTobeMapped.topRightCorner(3,1) = frame_curr->Q * exPbl + frame_curr->P;
 
+      /* 启动独立线程，构造角点特征点云与Map之间的Ceres代价函数 */
       threads[0] = std::thread(&Estimator::processPointToLine, this,
                                std::ref(edgesLine[f]),
                                std::ref(vLineFeatures[f]),
@@ -1107,6 +1261,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                std::ref(exTlb),
                                std::ref(transformTobeMapped));
 
+      /* 启动独立线程，构造平面特征点云与Map之间的Ceres代价函数 */
       threads[1] = std::thread(&Estimator::processPointToPlanVec, this,
                                std::ref(edgesPlan[f]),
                                std::ref(vPlanFeatures[f]),
@@ -1116,6 +1271,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                std::ref(exTlb),
                                std::ref(transformTobeMapped));
 
+      /* 启动独立线程，构造不规则特征点云与Map之间的Ceres代价函数 */
       threads[2] = std::thread(&Estimator::processNonFeatureICP, this,
                                std::ref(edgesNon[f]),
                                std::ref(vNonFeatures[f]),
@@ -1124,17 +1280,19 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                std::ref(kdtreeNonFeatureFromLocal),
                                std::ref(exTlb),
                                std::ref(transformTobeMapped));
-
+      /* 等待构造完成 */
       threads[0].join();
       threads[1].join();
       threads[2].join();
     }
 
+    /* 将构造好的代价函数添加到优化问题 */
     int cntSurf = 0;
     int cntCorner = 0;
     int cntNon = 0;
     if(windowSize == SLIDEWINDOWSIZE) {
       thres_dist = 1.0;
+      /* 如果是第一次迭代，则对代价函数的有效性进行检查，仅有残差大于0.00001的才是有效的 */
       if(iterOpt == 0){
         for(int f=0; f<windowSize; ++f){
           int cntFtu = 0;
@@ -1246,6 +1404,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         }
     }
 
+    /* 开始优化 */
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_SCHUR;
     options.trust_region_strategy_type = ceres::DOGLEG;
@@ -1255,18 +1414,28 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
+    /* 将完成优化的状态变量值更新到lidarFrameList中 */
+    /* 待优化的状态变量保存在para_PR和para_VBias数组中 */
+    /* 将para_PR和para_VBias数组中的位姿转存到lidarFrameList中 */
     double2vector(lidarFrameList);
 
+    /* 取得优化后的位姿，获得优化前后的位姿增量 */
     Eigen::Quaterniond q_after_opti = lidarFrameList.back().Q;
     Eigen::Vector3d t_after_opti = lidarFrameList.back().P;
     Eigen::Vector3d V_after_opti = lidarFrameList.back().V;
     double deltaR = (q_before_opti.angularDistance(q_after_opti)) * 180.0 / M_PI;
     double deltaT = (t_before_opti - t_after_opti).norm();
 
+    /* 位姿增量小于阈值或达到最大迭代次数，停止 */
     if (deltaR < 0.05 && deltaT < 0.05 || (iterOpt+1) == max_iters){
       ROS_INFO("Frame: %d\n",frame_count++);
       if(windowSize != SLIDEWINDOWSIZE) break;
+      
+      /* 开展边缘优化 */
+      /* 所谓边缘优化是指，将此次优化后的状态变量，以及代价函数添加到下一次优化中继续优化，以获得更高的精度 */
+      /* 也就是说，每次实际上是有三帧点云参与优化 */
       // apply marginalization
+      /* 更新本轮的边缘信息，准备存储待优化的状态变量和代价函数 */
       auto *marginalization_info = new MarginalizationInfo();
       if (last_marginalization_info){
         std::vector<int> drop_set;
@@ -1284,8 +1453,14 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         marginalization_info->addResidualBlockInfo(residual_block_info);
       }
       
+      /* 将IMU预积分相关的残差添加到边缘优化 */
+      /* 注意这里只添加第j帧一帧的IMU预积分代价函数到优化问题 */
+      /* IMU预积分是从i到j之间所有数据的预积分，因此只需要添加一帧即可 */
+      /* 取得指向点云帧的迭代器，并指向第2帧，即第j帧 */
       auto frame_curr = lidarFrameList.begin();
       std::advance(frame_curr, 1);
+
+      /* 添加IMU预积分的代价函数，其中包含了状态变量para_PR和para_VBias */
       ceres::CostFunction* IMU_Cost = Cost_NavState_PRV_Bias::Create(frame_curr->imuIntegrator,
                                                                      const_cast<Eigen::Vector3d&>(gravity),
                                                                      Eigen::LLT<Eigen::Matrix<double, 15, 15>>
@@ -1296,10 +1471,17 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                                         std::vector<int>{0, 1});
       marginalization_info->addResidualBlockInfo(residual_block_info);
 
+      /* 对点云列表lidarFrameList中的第一帧点云进行边缘优化 */
+      /* lidarFrameList中的第一帧点云(即此次匹配的第i帧)在此次优化后即将被删除，边缘优化的就是这一帧
+      /* lidarFrameList中的第二帧点云(即此次匹配的第j帧)则会被保留下来作为下次匹配的第i帧 */
+      /* 注意f=0，即取第i帧进行边缘优化 */
       int f = 0;
       transformTobeMapped = Eigen::Matrix4d::Identity();
       transformTobeMapped.topLeftCorner(3,3) = frame_curr->Q * exRbl;
       transformTobeMapped.topRightCorner(3,1) = frame_curr->Q * exPbl + frame_curr->P;
+      
+      /* 分别求第i帧的角点、平面点、不规则特征点云到Map的代价函数 */
+      /* 与前面不同的是，此时已经完成主体优化，状态变量的估计值已经变成了优化值 */
       edgesLine[f].clear();
       edgesPlan[f].clear();
       edgesNon[f].clear();
@@ -1333,6 +1515,8 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       threads[0].join();
       threads[1].join();
       threads[2].join();
+
+      /* 将状态变量及代价函数添加到边缘优化 */
       int cntFtu = 0;
       for (auto &e : edgesLine[f]) {
         if(vLineFeatures[f][cntFtu].valid){
@@ -1365,17 +1549,20 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         cntFtu++;
       }
 
+      /* FIXME:这里的两个操作具体是什么目的不明白 */
       marginalization_info->preMarginalize();
       marginalization_info->marginalize();
 
+      /* 把第i帧的状态变量挪到第j帧 */
       std::unordered_map<long, double *> addr_shift;
       for (int i = 1; i < SLIDEWINDOWSIZE; i++)
       {
         addr_shift[reinterpret_cast<long>(para_PR[i])] = para_PR[i - 1];
         addr_shift[reinterpret_cast<long>(para_VBias[i])] = para_VBias[i - 1];
       }
+      
+      /* 更新last_marginalization_info，准备下一轮优化*/
       std::vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
-
       delete last_marginalization_info;
       last_marginalization_info = marginalization_info;
       last_marginalization_parameter_blocks = parameter_blocks;
