@@ -156,6 +156,9 @@ void IMUIntegrator::PreIntegration(double lastTime, const Eigen::Vector3d& bg, c
   }
 }
 
+/** @brief 求加速度测量均值
+  * @return 返回当前帧的重力加速度均值
+  */
 Eigen::Vector3d IMUIntegrator::GetAverageAcc() {
   int i = 0;
   Eigen::Vector3d sum_acc(0, 0, 0);

@@ -318,9 +318,10 @@ public:
 };
 
 /** \brief Ceres Cost Funtion between Lidar Pose and IMU Preintegration
- *  @param [in] measure_ IMU积分的结果
+ *  @brief IMU预积分代价函数
+ *  @param [in] measure_ 当前帧的IMUIntegrator，从中获得IMU测量值
  *  @param [in] GravityVec_ 重力加速度向量
- *  @param [in] sqrt_information_ 
+ *  @param [in] sqrt_information_ 具体的含义还不清楚，来自IMU测量噪声协方差矩阵的分解
  */
 struct Cost_NavState_PRV_Bias
 {
@@ -348,7 +349,7 @@ struct Cost_NavState_PRV_Bias
 		Eigen::Map<const Eigen::Matrix<T, 6, 1>> PRj(prj_);
 		Eigen::Matrix<T, 3, 1> Pj = PRj.template segment<3>(0);
 		Sophus::SO3<T> SO3_Rj = Sophus::SO3<T>::exp(PRj.template segment<3>(3));
-    /* 获得速度Vi和偏差dbgi、dbai */
+    /* 获得速度Vi和偏差增量dbgi、dbai */
 		Eigen::Map<const Eigen::Matrix<T, 9, 1>> velobiasi(velobiasi_);
 		Eigen::Matrix<T, 3, 1> Vi = velobiasi.template segment<3>(0);
 		Eigen::Matrix<T, 3, 1> dbgi = velobiasi.template segment<3>(3) - imu_measure.GetBiasGyr().cast<T>();
@@ -725,8 +726,13 @@ struct Cost_Initial_G
 };
 
 /** \brief Ceres Cost Funtion of IMU Factor in LIO Initialization
- */
-struct Cost_Initialization_IMU
+ *  @brief IMU预积分代价函数
+ *  @param measure_ 当前帧的IMUIntegrator，从中获得IMU测量值
+ *  @param ri_ 第i帧的姿态
+ *  @param rj_ 第j帧的姿态
+ *  @param dp_ 从i到j的位置增量
+ *  @param sqrt_information_ 具体的含义还不清楚，来自IMU测量噪声协方差矩阵的分解
+ */struct Cost_Initialization_IMU
 {
 	EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 	Cost_Initialization_IMU(IMUIntegrator& measure_,
@@ -744,6 +750,7 @@ struct Cost_Initialization_IMU
 	bool operator()(const T *rwg_, const T *vi_, const T *vj_, const T *ba_, const T *bg_, T *residual) const {
 		Eigen::Matrix<T, 3, 1> G_I{T(0), T(0), T(-9.805)};
 		
+    /* 获得偏差增量dbgi、dbai */
 		Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba(ba_);
 		Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg(bg_);
 		Eigen::Matrix<T, 3, 1> dbg = bg - imu_measure.GetBiasGyr().cast<T>();
@@ -754,9 +761,11 @@ struct Cost_Initialization_IMU
 
 		Eigen::Matrix<T, 3, 1> dP = dp.cast<T>();
 
+    /* 获得初始姿态，即初始的重力加速度方向 */
 		Eigen::Map<const Eigen::Matrix<T, 3, 1>> rwg(rwg_);
 		Sophus::SO3<T> SO3_Rwg = Sophus::SO3<T>::exp(rwg);
 
+    /* 获得Vi和Vj */
 		Eigen::Map<const Eigen::Matrix<T, 3, 1>> vi(vi_);
 		Eigen::Matrix<T, 3, 1> Vi = vi;
 		Eigen::Map<const Eigen::Matrix<T, 3, 1>> vj(vj_);
@@ -765,22 +774,35 @@ struct Cost_Initialization_IMU
 		Eigen::Map<Eigen::Matrix<T, 9, 1> > eResiduals(residual);
 		eResiduals = Eigen::Matrix<T, 9, 1>::Zero();
 
+    /* 求i、j两帧之间的dt和dt^2 */
 		T dTij = T(imu_measure.GetDeltaTime());
 		T dT2 = dTij*dTij;
+    /* 求i、j两帧之间的位置增量dPij，速度增量dVij，姿态增量dRij */
 		Eigen::Matrix<T, 3, 1> dPij = imu_measure.GetDeltaP().cast<T>();
 		Eigen::Matrix<T, 3, 1> dVij = imu_measure.GetDeltaV().cast<T>();
 		Sophus::SO3<T> dRij = Sophus::SO3<T>(imu_measure.GetDeltaQ().cast<T>());
 		Sophus::SO3<T> RiT = SO3_Ri.inverse();
 
+    /* 求残差第一项rPij：雷达位置增量和IMU预积分位置增量之差 */
+    /* 下面第1行求雷达位置增量 */
+    /* 下面第2、3行在IMU预积分位置增量dPij的基础上叠加角速度和加速度偏差 */
 		Eigen::Matrix<T, 3, 1> rPij = RiT*(dP - Vi*dTij - SO3_Rwg*G_I*dT2*T(0.5)) -
 						(dPij + imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_P, IMUIntegrator::O_BG).cast<T>()*dbg +
 						imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_P, IMUIntegrator::O_BA).cast<T>()*dba);
 
+    /* 求残差第二项rPhiij：雷达姿态增量和IMU预积分姿态增量之差*/
+    /* (RiT * SO3_Rj)即是Rj乘以Ri的逆，得到雷达的姿态增量 */
+    /* dRij是IMU预积分姿态增量，叠加偏差dR_dbg后得到IMU预积分姿态增量 */
+    /* IMU预积分姿态增量求逆，再乘以雷达的姿态增量，得到两者之差 */
+    /* 姿态增量之差通过对数映射转成李代数，即向量的形式 */
 		Sophus::SO3<T> dR_dbg = Sophus::SO3<T>::exp(
 						imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_R, IMUIntegrator::O_BG).cast<T>()*dbg);
 		Sophus::SO3<T> rRij = (dRij * dR_dbg).inverse() * RiT * SO3_Rj;
 		Eigen::Matrix<T, 3, 1> rPhiij = rRij.log();
 
+    /* 求残差第三项rVij：雷达速度增量和IMU预积分速度增量之差 */
+    /* RiT*(……)即是PoseEstimation中求第j帧lidarFrame.V的逆过程，求得雷达的速度增量 */
+    /* 下面第2、3行在IMU预积分速度增量的基础上叠加偏差，得到IMU预积分速度增量 */
 		Eigen::Matrix<T, 3, 1> rVij = RiT*(Vj - Vi - SO3_Rwg*G_I*dTij) -
 						(dVij + imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_V, IMUIntegrator::O_BG).cast<T>()*dbg +
 										imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_V, IMUIntegrator::O_BA).cast<T>()*dba);
@@ -789,6 +811,9 @@ struct Cost_Initialization_IMU
 		eResiduals.template segment<3>(3) = rPhiij;
 		eResiduals.template segment<3>(6) = rVij;
 
+    /* FIXME:这里为什么要用信息矩阵去左乘残差不明白 */
+    /* 这里的sqrt_information就是对IMU预积分测量噪声的协方差矩阵的逆矩阵进行Cholesky分解，然后获得的L矩阵的转置 */
+    /* Cholesky分解本质上是对矩阵进行开方，下三角矩阵L即是原矩阵的平方根 */
 		eResiduals.applyOnTheLeft(sqrt_information.template cast<T>());
 
 		return true;
@@ -815,6 +840,8 @@ struct Cost_Initialization_IMU
 };
 
 /** \brief Ceres Cost Funtion of IMU Biases and Velocity Prior Factor in LIO Initialization
+ *  @brief 定义速度、偏差状态变量的代价函数
+ *    残差就是bv_与prior_之差
  */
 struct Cost_Initialization_Prior_bv
 {
@@ -852,6 +879,8 @@ struct Cost_Initialization_Prior_bv
 };
 
 /** \brief Ceres Cost Funtion of Rwg Prior Factor in LIO Initialization
+ *  @brief 定义姿态状态变量的代价函数
+ *    残差就是待优化姿态r_wg_和初始姿态prior_之间的姿态增量
  */
 struct Cost_Initialization_Prior_R
 {

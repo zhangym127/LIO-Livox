@@ -186,49 +186,63 @@ void RemoveLidarDistortion(pcl::PointCloud<PointType>::Ptr& cloud,
   }
 }
 
-
+/** @brief 进行位姿的初始化，获得重力加速度的方向，IMU的偏差等
+  *   1.在初始化之前，应该有三帧扫描点云完成了到Map的位姿优化
+  *   2.计算重力加速度的初始方向
+  *   3.以三帧点云的优化位姿和IMU的预积分位姿为残差，求得重力加速度的方向，以及IMU的偏差
+  *   4.基于优化后的IMU偏差，对三帧扫描点云之间的IMU数据重新进行预积分
+  */
 bool TryMAPInitialization() {
 
+  /* 获得起始帧对应的加速度均值 */
   Eigen::Vector3d average_acc = -lidarFrameList->begin()->imuIntegrator.GetAverageAcc();
   double info_g = std::fabs(9.805 - average_acc.norm());
+  /* 加速度均值归一化，再乘以重力加速度 */
   average_acc = average_acc * 9.805 / average_acc.norm();
 
+  /* 通过Ceres优化求初始重力加速度方向 */
   // calculate the initial gravity direction
+  
+  /* 定义状态变量——重力加速度方向 */
   double para_quat[4];
   para_quat[0] = 1;
   para_quat[1] = 0;
   para_quat[2] = 0;
   para_quat[3] = 0;
 
-
   ceres::LocalParameterization *quatParam = new ceres::QuaternionParameterization();
   ceres::Problem problem_quat;
   
+  /* 添加状态变量到优化问题 */
   problem_quat.AddParameterBlock(para_quat, 4, quatParam);
 
+  /* 添加代价函数到优化问题，残差就是用(para_quat*重力加速度-加速度均值) */
   problem_quat.AddResidualBlock(Cost_Initial_G::Create(average_acc),
                                 nullptr,
                                 para_quat);
-
+  /* 优化 */
   ceres::Solver::Options options_quat;
   ceres::Solver::Summary summary_quat;
   ceres::Solve(options_quat, &problem_quat, &summary_quat);
 
+  /* 取得重力加速度方向 */
   Eigen::Quaterniond q_wg(para_quat[0], para_quat[1], para_quat[2], para_quat[3]);
 
-
+  /* 定义状态变量的初始值，偏差为0 */
   //build prior factor of LIO initialization
   Eigen::Vector3d prior_r = Eigen::Vector3d::Zero();
   Eigen::Vector3d prior_ba = Eigen::Vector3d::Zero();
   Eigen::Vector3d prior_bg = Eigen::Vector3d::Zero();
   std::vector<Eigen::Vector3d> prior_v;
-  int v_size = lidarFrameList->size();
+  int v_size = lidarFrameList->size(); //应该有三帧点云
   for(int i = 0; i < v_size; i++) {
     prior_v.push_back(Eigen::Vector3d::Zero());
   }
+  /* 重力加速度方向转成旋转矩阵，再转成李代数，获得起始帧对应的初始位姿prior_r */
   Sophus::SO3d SO3_R_wg(q_wg.toRotationMatrix());
   prior_r = SO3_R_wg.log();
   
+  /* 求每帧对应的初始速度prior_v */
   for (int i = 1; i < v_size; i++){
     auto iter = lidarFrameList->begin();
     auto iter_next = lidarFrameList->begin();
@@ -240,6 +254,7 @@ bool TryMAPInitialization() {
   }
   prior_v[0] = prior_v[1];
 
+  /* 定义待优化的状态变量，包括速度、姿态、偏差 */
   double para_v[v_size][3];
   double para_r[3];
   double para_ba[3];
@@ -262,6 +277,7 @@ bool TryMAPInitialization() {
   Eigen::Matrix<double, 3, 3> sqrt_information_bg = 4000.0 * Eigen::Matrix<double, 3, 3>::Identity();
   Eigen::Matrix<double, 3, 3> sqrt_information_v = 4000.0 * Eigen::Matrix<double, 3, 3>::Identity();
 
+  /* 将待优化的状态变量添加到优化问题 */
   ceres::Problem::Options problem_options;
   ceres::Problem problem(problem_options);
   problem.AddParameterBlock(para_r, 3);
@@ -271,18 +287,23 @@ bool TryMAPInitialization() {
     problem.AddParameterBlock(para_v[i], 3);
   }
   
+  /* 添加代价函数 */
   // add CostFunction
+  
+  /* 姿态残差就是prior_r与para_r之间的姿态增量 */
   problem.AddResidualBlock(Cost_Initialization_Prior_R::Create(prior_r, sqrt_information_r),
                            nullptr,
                            para_r);
-  
+  /* FIXME:下面这两个代价函数中prior_ba和prior_bg的值都是0，进行优化不就变成了使para_ba和para_bg趋近于0？这样的优化有什么意思？*/
+  /* IMU偏差残差就是prior_ba与para_ba之差*/
   problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_ba, sqrt_information_ba),
                            nullptr,
                            para_ba);
+  /* IMU偏差残差就是prior_bg与para_bg之差*/
   problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_bg, sqrt_information_bg),
                            nullptr,
                            para_bg);
-
+  /* 速度残差就是prior_v与para_v之差*/
   for(int i = 0; i < v_size; i++) {
     problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_v[i], sqrt_information_v),
                              nullptr,
@@ -295,6 +316,7 @@ bool TryMAPInitialization() {
     std::advance(iter, i-1);
     std::advance(iter_next, i);
 
+    /* 从lidarFrame.Q、lidarFrame.P中取得位置和姿态，这个位姿来自扫描点云到Map的匹配优化 */
     Eigen::Vector3d pi = iter->P + iter->Q*exPlb;
     Sophus::SO3d SO3_Ri(iter->Q*exRlb);
     Eigen::Vector3d ri = SO3_Ri.log();
@@ -302,6 +324,9 @@ bool TryMAPInitialization() {
     Sophus::SO3d SO3_Rj(iter_next->Q*exRlb);
     Eigen::Vector3d rj = SO3_Rj.log();
 
+    /* 添加IMU预积分代价函数到优化问题 */
+    /* 与完成初始化之后的IMU预积分代价函数构造方式基本上一致 */
+    /* 残差就是点云匹配的位姿和IMU预积分的位姿之差 */
     problem.AddResidualBlock(Cost_Initialization_IMU::Create(iter_next->imuIntegrator,
                                                                    ri,
                                                                    rj,
@@ -317,6 +342,7 @@ bool TryMAPInitialization() {
                              para_bg);
   }
 
+  /* 开始优化 */
   ceres::Solver::Options options;
   options.minimizer_progress_to_stdout = false;
   options.linear_solver_type = ceres::DENSE_QR;
@@ -324,17 +350,22 @@ bool TryMAPInitialization() {
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);
 
+  /* 取得优化后的姿态，即重力加速度方向 */
+  /* FIXME:似乎只有在初始化时才对重力加速度方向进行更新，难道不怕方向跑偏？ */
   Eigen::Vector3d r_wg(para_r[0], para_r[1], para_r[2]);
   GravityVector = Sophus::SO3d::exp(r_wg) * Eigen::Vector3d(0, 0, -9.805);
 
+  /* 取得优化后的IMU偏差 */
   Eigen::Vector3d ba_vec(para_ba[0], para_ba[1], para_ba[2]);
   Eigen::Vector3d bg_vec(para_bg[0], para_bg[1], para_bg[2]);
 
+  /* 如果偏差太大则初始化失败 */
   if(ba_vec.norm() > 0.5 || bg_vec.norm() > 0.5) {
     ROS_WARN("Too Large Biases! Initialization Failed!");
     return false;
   }
 
+  /* 用优化后的偏差和速度来更新点云帧列表lidarFrameList */
   for(int i = 0; i < v_size; i++) {
     auto iter = lidarFrameList->begin();
     std::advance(iter, i);
@@ -349,6 +380,7 @@ bool TryMAPInitialization() {
     iter->V = bv_vec;
   }
 
+  /* 基于IMU偏差的优化值，进行i、j两帧之间的IMU预积分 */
   for(size_t i = 0; i < v_size - 1; i++){
     auto laser_trans_i = lidarFrameList->begin();
     auto laser_trans_j = lidarFrameList->begin();
@@ -357,12 +389,13 @@ bool TryMAPInitialization() {
     laser_trans_j->imuIntegrator.PreIntegration(laser_trans_i->timeStamp, laser_trans_i->bg, laser_trans_i->ba);
   }
 
-
+  /* 删除超出滑动窗口的点云帧 */
   // //if IMU success initialized
   WINDOWSIZE = Estimator::SLIDEWINDOWSIZE;
   while(lidarFrameList->size() > WINDOWSIZE){
 	  lidarFrameList->pop_front();
   }
+  /* 将位置和姿态转成IMU坐标系 */
 	Eigen::Vector3d Pwl = lidarFrameList->back().P;
 	Eigen::Quaterniond Qwl = lidarFrameList->back().Q;
 	lidarFrameList->back().P = Pwl + Qwl*exPlb;
@@ -434,6 +467,15 @@ void process(){
             boost::shared_ptr<std::list<Estimator::LidarFrame>> lidar_list;
             if(!vimuMsg.empty()){
                 if(!LidarIMUInited) { /* 尚未完成初始化 */
+                
+                    /* 所谓尚未完成初始化，主要指的是尚未找到重力加速度的方向 */
+                    /* 对比初始化和未初始化，一个重要区别是是否使用了重力加速度GravityVector */
+                    /* 未初始化时，尚未找到重力加速度方向，因此没有使用重力加速度 */
+                    
+                    /* 对比初始化和未初始化，另一个重要区别是： */
+                    /* 初始化之前，仅仅是对角速度进行积分 */
+                    /* 初始化之后，进行完整的IMU预积分，计算P、V、Q，计算测量噪声的协方差矩阵 */
+                    
                     // if get IMU msg successfully, use gyro integration to update delta_Rl
                     /* 对IMU的角速度进行积分 */
                     lidarFrame.imuIntegrator.PushIMUMsg(vimuMsg);
@@ -442,6 +484,10 @@ void process(){
                     delta_Rb = lidarFrame.imuIntegrator.GetDeltaQ().toRotationMatrix();
                     /* FIXME: 这里为什么要用外参矩阵及其转置夹乘IMU旋转增量的方式转成Lidar旋转增量？ */
                     delta_Rl = exTlb.topLeftCorner(3, 3) * delta_Rb * exTlb.topLeftCorner(3, 3).transpose();
+
+                    /* 对比初始化和未初始化，再一个重要区别是： */
+                    /* 初始化之前，从transformAftMapped获得前一帧位姿，叠加IMU积分增量后获得当前帧的位姿 */
+                    /* 初始化之后，从上一帧即lidarFrameList->back()获得前一帧位姿，叠加IMU积分增量后获得当前帧的位姿 */
 
                     // predict current lidar pose
                     /* 估计雷达的位置P和姿态Q */
@@ -454,6 +500,8 @@ void process(){
                     lidar_list->push_back(lidarFrame);
                     
                 }else{ /* 已经完成初始化 */
+                
+                    /* FIXME:似乎只有在初始化时才对重力加速度方向GravityVector进行更新，难道不怕方向跑偏？ */
                 
                     // if get IMU msg successfully, use pre-integration to update delta lidar pose
                     /* 对角速度和线速度进行预积分 */
@@ -473,6 +521,7 @@ void process(){
                     double dt = lidarFrame.imuIntegrator.GetDeltaTime();
 
                     /* 叠加增量到上一帧，更新当前帧的IMU位置、姿态、速度和偏差 */
+                    /* 注意这里的偏差直接从上一帧获得，上一帧的偏差是经过优化的 */
                     lidarFrame.Q = Qwbpre * dQ;
                     lidarFrame.P = Pwbpre + Vwbpre*dt + 0.5*GravityVector*dt*dt + Qwbpre*(dP);
                     lidarFrame.V = Vwbpre + GravityVector*dt + Qwbpre*(dV);
@@ -495,7 +544,7 @@ void process(){
                     delta_tb = dP;
 
                     /* 将当前点云帧添加到点云帧列表末尾中，并清除旧列表头端点云 */
-					/* 从IMU预积分的算法来看，队列中应该始终只有两帧点云：i和j */
+                    /* 从IMU预积分的算法来看，队列中应该始终只有两帧点云：i和j */
                     /* 在IMU_Mode=1（即用IMU进行帧内校正）时lidarFrameList的长度为1 */
                     lidarFrameList->push_back(lidarFrame);
                     lidarFrameList->pop_front();
@@ -516,6 +565,11 @@ void process(){
                 }
             }
 
+            /* 不论IMU是否初始化，下面都会进行扫描点云到Map的匹配优化，从而获得每一帧的位姿，包括lidarFrame.Q、
+             * lidarFrame.P、lidarFrame.V等，这样才能在IMU初始化时，基于IMU预积分代价函数，通过优化获得重力加
+             * 速度的方向和IMU偏差等，这也是为什么将IMU的初始化TryMAPInitialization()放在最后面的原因，必须等
+             * 到至少有了三帧的点云数据之后才会启动初始化。 */
+            
             /* 点云帧内校正 */
             // remove lidar distortion
             RemoveLidarDistortion(laserCloudFullRes, delta_Rl, delta_tl);
@@ -591,6 +645,9 @@ void process(){
                 pushCount++;
                 
                 /* 在收到三帧点云后才能开始初始化 */
+                /* 初始化之前，确保这三帧点云都进行了扫描点云到Map的匹配优化，这三帧优化确保每帧点云的 */
+                /* lidarFrame.P、Q、V都有初值，基于这个初值才能在初始化过程中通过优化获得重力加速度方向、
+                 * IMU偏差等 */
                 if (pushCount >= 3){
                     pushCount = 0;
                     if(lidarFrameList->size() > 1){
