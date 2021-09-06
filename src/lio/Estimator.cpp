@@ -39,6 +39,8 @@ Estimator::Estimator(const float& filter_corner, const float& filter_surf){
   downSizeFilterCorner.setLeafSize(filter_corner, filter_corner, filter_corner);
   downSizeFilterSurf.setLeafSize(filter_surf, filter_surf, filter_surf);
   downSizeFilterNonFeature.setLeafSize(0.4, 0.4, 0.4);
+  
+  /* 创建地图生成器，并启动独立线程，负责地图的生成 */
   map_manager = new MAP_MANAGER(filter_corner, filter_surf);
   threadMap = std::thread(&Estimator::threadMapIncrement, this);
 }
@@ -47,6 +49,10 @@ Estimator::~Estimator(){
   delete map_manager;
 }
 
+/** @brief 建图线程
+  *   将ForMap容器中的点云添加到Map
+  *   通过互斥信号量mtx_Map实现与EstimateLidarPose实现同步，一个消费，一个生产
+  */
 [[noreturn]] void Estimator::threadMapIncrement(){
   pcl::PointCloud<PointType>::Ptr laserCloudCorner(new pcl::PointCloud<PointType>);
   pcl::PointCloud<PointType>::Ptr laserCloudSurf(new pcl::PointCloud<PointType>);
@@ -56,7 +62,7 @@ Estimator::~Estimator(){
   pcl::PointCloud<PointType>::Ptr laserCloudNonFeature_to_map(new pcl::PointCloud<PointType>);
   Eigen::Matrix4d transform;
   while(true){
-    /* 加锁保护点云确保点云容器的原子操作 */
+    /* 加锁保护点云确保ForMap容器的原子操作 */
     std::unique_lock<std::mutex> locker(mtx_Map);
     if(!laserCloudCornerForMap->empty()){
 
@@ -102,6 +108,7 @@ Estimator::~Estimator(){
     }else
       locker.unlock();
 
+    /* 休眠2毫秒，避免死等 */
     std::chrono::milliseconds dura(2);
     std::this_thread::sleep_for(dura);
   }
@@ -981,6 +988,9 @@ void Estimator::double2vector(std::list<LidarFrame>& lidarFrameList){
 }
 
 /** @brief 位姿优化
+  *   1、将三种特征点分开，并降采样
+  *   2、进行点云匹配，获得优化后的位姿
+  *   3、将匹配后的特征点云添加到Map
   * @param [in] lidarFrameList: 点云帧列表
   * @param [in] exTlb: 从Lidar坐标系到IMU坐标系的外参
   * @param [in] gravity: 重力加速度向量
@@ -1059,6 +1069,8 @@ void Estimator::EstimateLidarPose(std::list<LidarFrame>& lidarFrameList,
   transformTobeMapped.topLeftCorner(3,3) = lidarFrameList.front().Q * exRbl;
   transformTobeMapped.topRightCorner(3,1) = lidarFrameList.front().Q * exPbl + lidarFrameList.front().P;
 
+  /* 将完成匹配的特征点云分别添加到Map和本地Map */
+  
   /* 将降采样后的特征点云添加到ForMap容器，threadMapIncrement线程会从该容器取出点云叠加到Map中 */
   std::unique_lock<std::mutex> locker(mtx_Map);
   *laserCloudCornerForMap = *laserCloudCornerStack[0];
@@ -1584,6 +1596,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
 }
 
 /** @brief 将特征点云变换到地图坐标系，添加到FromLocal容器
+  *   本地Map每次都重新生成，只保存最近的50帧点云数据
   * @param [in] laserCloudCornerStack: 角点特征点云
   * @param [in] laserCloudSurfStack: 平面特征点云
   * @param [in] laserCloudNonFeatureStack: 不规则特征点云

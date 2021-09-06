@@ -574,7 +574,7 @@ void process(){
             // remove lidar distortion
             RemoveLidarDistortion(laserCloudFullRes, delta_Rl, delta_tl);
 
-            /* 位姿优化 */
+            /* 位姿优化，并生成Map */
             // optimize current lidar pose with IMU
             estimator->EstimateLidarPose(*lidar_list, exTlb, GravityVector, debugInfo);
 
