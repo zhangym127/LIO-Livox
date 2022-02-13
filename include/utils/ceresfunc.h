@@ -449,6 +449,13 @@ struct Cost_NavState_IMU_Line
       Plb = -(qlb * Pbl);
     }
 
+	/**
+	 * @brief 代价函数的实体
+	 * @tparam T 
+	 * @param PRi 待优化的位姿，初始值来自para_PR
+	 * @param residual 本轮优化后获得的残差值
+	 * @return true 总是返回true
+	 */
     template <typename T>
     bool operator()(const T *PRi, T *residual) const {
       Eigen::Matrix<T, 3, 1> cp{T(point.x()), T(point.y()), T(point.z())};

@@ -114,7 +114,9 @@ Estimator::~Estimator(){
   }
 }
 
-/** @brief 求待匹配角点特征点云中每个点到Map的距离，为每个点构造一个代价函数
+/** @brief 对于待匹配角点特征点云中的每个点p，在Map找到最近的线特征，在线特征上构造a、b两个点，然后以点p到
+  * 直线ab的距离为优化目标，构造一个代价函数，添加到edges中。同时，直接计算点p到直线ab的距离，保存到vLineFeatures
+  * 中，如果该距离小于某个阈值，则对应的代价函数不需要优化。
   * @param [out] edges 构造好的代价函数
   * @param [out] vLineFeatures 线特征容器
   * @param [in] laserCloudCorner 角点特征点云，即待匹配点云
@@ -166,6 +168,7 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
   int debug_num12 = 0;
   int debug_num22 = 0;
   
+  /* 为待匹配的特征点云中的每一个点构造一个代价函数添加到edges中 */
   for (int i = 0; i < laserCloudCornerStackNum; i++) {
     /* 从待匹配点云中取一个点 */
     _pointOri = laserCloudCorner->points[i];
@@ -256,7 +259,7 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
           Eigen::Vector3d tripod1(x1, y1, z1);
           Eigen::Vector3d tripod2(x2, y2, z2);
 
-          /* 构造角点特征点云到Map的代价函数 */
+          /* 构造角点特征点到Map的代价函数 */
           /* 点p到直线ab的距离即是残差 */
           /* 注意下面用于构造代价函数的p点用的是原始点，而不是转换到Map坐标系的点_pointSel */
           /* 因为_pointSel不包含IMU到Lidar的外参变换，精度不够 */
@@ -273,7 +276,7 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
           vLineFeatures.emplace_back(Eigen::Vector3d(_pointOri.x,_pointOri.y,_pointOri.z),
                                      tripod1,
                                      tripod2);
-          /* 计算误差 */
+          /* 直接计算点p到直线ab的距离作为误差，如果误差小于某个阈值，则该代价函数不需要优化 */
           vLineFeatures.back().ComputeError(m4d);
 
           continue;
@@ -1020,7 +1023,7 @@ void Estimator::EstimateLidarPose(std::list<LidarFrame>& lidarFrameList,
 
   /* 准备待匹配特征点云，分成三类特征后存放到Stack容器中，不同的帧放在不同的层中 */
   /* 当IMU_Mode=1时，lidarFrameList的长度＝1，Stack容器深度=1 */
-  /* 当IMU_Mode=2时，lidarFrameList的长度＞1，Stack容器深度>1 */
+  /* 当IMU_Mode=2时，lidarFrameList的长度=20，Stack容器深度>1 */
   /* FIXME:Stack容器的最大深度只有2，但是lidarFrameList的最大长度似乎不止*/
   int stack_count = 0; //Stack容器深度
   for(const auto& l : lidarFrameList){
@@ -1092,7 +1095,7 @@ void Estimator::EstimateLidarPose(std::list<LidarFrame>& lidarFrameList,
 }
 
 /** @brief 位姿优化
-  *   每次优化使用两帧点云，分别是i和j
+  *   每次优化使用两帧点云，分别是i和j，i是上一帧，j是当前帧
   *   优化的状态变量有六个：Pi，Vi，Ri，Pj，Vj，Rj，δbg，δba
   *   首先对i和j之间的IMU数据进行预积，获得第j帧的位姿估计值，同时获得i、j之间的预积分
   *   将预积分代价函数添加到优化问题，以实现对偏差δbg，δba的优化
@@ -1115,7 +1118,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
   int num_surf_map = 0;
 
   static uint32_t frame_count = 0;
-  /* lidarFrameList中的帧数就是窗口的Size，从上下文来看为2的可能性较大 */
+  /* lidarFrameList中的帧数就是窗口的Size，在IMU紧耦合模式下等于2 */
   /* 这里应用了IMU预积分算法，IMU预积分的残差每次需要用到两帧点云对应位姿，分别称作第i和第j帧 */
   int windowSize = lidarFrameList.size();
   Eigen::Matrix4d transformTobeMapped = Eigen::Matrix4d::Identity();
@@ -1170,16 +1173,21 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     thres_dist = 25.0;
   }
 
+  /**
+   * @brief 开始迭代优化，最多迭代5次，每迭代一次iterOpt加一
+   */
   // excute optimize process
   const int max_iters = 5;
   for(int iterOpt=0; iterOpt<max_iters; ++iterOpt){
 
-    /* 准备待优化的状态变量初始值 */
-    /* 待优化的状态变量保存在para_PR和para_VBias数组中 */
-    /* 将lidarFrameList中的位姿转存到para_PR和para_VBias数组中 */
-    /* para_PR中保存位置和姿态，其中姿态以李代数的形式保存 */
-    /* para_VBias中保存的是速度和偏差 */
-    /* 转存为C++数组的原因是ceres库只接受数组形式的参数 */
+    /**
+     * @brief 优化第一步：准备待优化的状态变量para_PR和para_VBias
+     * 待优化的状态变量保存在para_PR和para_VBias数组中
+     * 将lidarFrameList中的位姿转存到para_PR和para_VBias数组中，作为初始值
+     * para_PR中保存位置和姿态，其中姿态以李代数的形式保存
+     * para_VBias中保存的是速度和偏差
+     * 转存为C++数组的原因是ceres库只接受数组形式的参数
+     */
     vector2double(lidarFrameList);
 
     /* 创建huber损失函数 */
@@ -1197,6 +1205,13 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     ceres::Problem::Options problem_options;
     ceres::Problem problem(problem_options);
 
+    /**
+     * @brief 优化第二步：将IMU预积分相关的残差添加到优化问题
+     * 注意这里只添加第j帧一帧的IMU预积分代价函数到优化问题。
+     * IMU预积分是从i到j之间所有数据的预积分，因此只需要添加一帧即可。
+     * IMU预积分的结果就是在这里发挥作用。
+     */
+
     /* 将位置和姿态以参数块的方式添加到优化问题 */
     for(int i=0; i<windowSize; ++i) {
       problem.AddParameterBlock(para_PR[i], 6);
@@ -1206,9 +1221,6 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     for(int i=0; i<windowSize; ++i)
       problem.AddParameterBlock(para_VBias[i], 9);
 
-    /* 将IMU预积分相关的残差添加到优化问题 */
-    /* 注意这里只添加第j帧一帧的IMU预积分代价函数到优化问题 */
-    /* IMU预积分是从i到j之间所有数据的预积分，因此只需要添加一帧即可 */
     // add IMU CostFunction
     for(int f=1; f<windowSize; ++f){
       /* 取得指向第一帧的迭代器 */
@@ -1230,10 +1242,12 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                para_VBias[f]);  //参数velobiasj_
     }
 
-    /* 进行边缘优化 */
-    /* 每一轮都有两帧点云参与优化，分别是i和j */
-    /* 将上一轮中的第i帧对应的状态变量及其代价函数加入到当前帧的优化问题中进行同步优化，以获得更高精度 */
-    /* 因此实际上每一轮都有三帧点云参与优化 */
+    /**
+     * @brief 优化第三步：进行边缘优化
+     * 每一轮都有两帧点云参与优化，分别是i和j
+     * 将上一轮中的第i帧对应的状态变量及其代价函数加入到当前帧的优化问题中进行同步优化，以获得更高精度
+     * 因此实际上每一轮都有三帧点云参与优化
+     */
     if (last_marginalization_info){
       // construct new marginlization_factor
       auto *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
@@ -1245,7 +1259,18 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     Eigen::Quaterniond q_before_opti = lidarFrameList.back().Q;
     Eigen::Vector3d t_before_opti = lidarFrameList.back().P;
 
-    /* 定义存放代价函数的的容器 */
+    /**
+     * @brief 优化第四步：以当前扫描点云到Map的距离为优化目标构造代价函数，添加到优化问题。这部分
+     * 内容与livox_horizon_loam中构造代价函数的方法几乎完全一致，唯一的区别是增加了不规则特征点对
+     * 应的代价函数，在这个过程中并未使用IMU预积分的结果。
+     *   以角点特征点为例，构造的方法是为当前扫描点云中的每一个点p在map中找到最近的点a和b，然后
+     * 以点p、a和b为已知数据，待优化位姿para_PR为未知数据，构造一个代价函数。优化过程中Ceres将找到
+     * 最优的位姿para_PR，对点p进行变换，使得p到直线ab的距离最小。
+     *   由于点的数量众多，需要逐一构造代价函数，因此创建三个线程来提高并行度，创建好的代价函数存放在
+     * edgesLine、edgesPlan、edgesNon中，然后再连同待优化位姿para_PR添加到优化问题。
+     */
+    
+    /* 定义存放代价函数的的容器，几乎每个点都有一个代价函数 */
     std::vector<std::vector<ceres::CostFunction *>> edgesLine(windowSize);
     std::vector<std::vector<ceres::CostFunction *>> edgesPlan(windowSize);
     std::vector<std::vector<ceres::CostFunction *>> edgesNon(windowSize);
@@ -1302,6 +1327,8 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     int cntSurf = 0;
     int cntCorner = 0;
     int cntNon = 0;
+    /* 如果windowSize=2，则使用1.0的阈值 */
+    /* FIXME: 修改阈值似乎并没有任何意义，多此一举 */
     if(windowSize == SLIDEWINDOWSIZE) {
       thres_dist = 1.0;
       /* 如果是第一次迭代，则对代价函数的有效性进行检查，仅有残差大于0.00001的才是有效的 */
@@ -1310,6 +1337,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
           int cntFtu = 0;
           for (auto &e : edgesLine[f]) {
             if(std::fabs(vLineFeatures[f][cntFtu].error) > 1e-5){
+              /* 将代价函数e和待优化位姿para_PR添加到优化问题 */
               problem.AddResidualBlock(e, loss_function, para_PR[f]);
               vLineFeatures[f][cntFtu].valid = true;
             }else{
@@ -1343,7 +1371,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
             cntNon++;
           }
         }
-      }else{
+      }else{ /* 如果不是第一次迭代，则直接使用使用第一次迭代的结果，不再检查代价函数的有效性 */
         for(int f=0; f<windowSize; ++f){
           int cntFtu = 0;
           for (auto &e : edgesLine[f]) {
@@ -1372,7 +1400,8 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
           }
         }
       }
-    } else {
+    } else { /* 如果windowSize=2，则使用1.0的阈值 */
+        /* FIXME: 修改阈值似乎并没有任何意义，下面整段代码都是多此一举 */
         if(iterOpt == 0) {
           thres_dist = 10.0;
         } else {
@@ -1416,6 +1445,10 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         }
     }
 
+    /**
+     * @brief 优化第五步：开始优化
+     */
+
     /* 开始优化 */
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_SCHUR;
@@ -1438,6 +1471,12 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     double deltaR = (q_before_opti.angularDistance(q_after_opti)) * 180.0 / M_PI;
     double deltaT = (t_before_opti - t_after_opti).norm();
 
+    /**
+     * @brief 优化第六步：开始准备下一轮优化的边缘优化数据准备
+     * 边缘优化的内容是全新的内容，总共四个步骤，理解有一定的难度，尤其是第一步和第四步。
+     * FIXME: 还需要进一步的深入研究
+     */
+
     /* 位姿增量小于阈值或达到最大迭代次数，停止 */
     if (deltaR < 0.05 && deltaT < 0.05 || (iterOpt+1) == max_iters){
       ROS_INFO("Frame: %d\n",frame_count++);
@@ -1445,10 +1484,18 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       
       /* 开展边缘优化 */
       /* 所谓边缘优化是指，将此次优化后的状态变量，以及代价函数添加到下一次优化中继续优化，以获得更高的精度 */
-      /* 也就是说，每次实际上是有三帧点云参与优化 */
+      /* 也就是说，每次实际上是有多帧点云参与优化 */
+
       // apply marginalization
       /* 更新本轮的边缘信息，准备存储待优化的状态变量和代价函数 */
       auto *marginalization_info = new MarginalizationInfo();
+
+      /**
+       * @brief 边缘优化第一步：将上一轮边缘优化的代价函数和待优化参数再次添加到边缘优化中
+       * 需要注意的是，这里设置了drop_set，即有部分内容是要丢弃的，并不是完全将之前的内容完全添加到下一轮优化中
+       * 否则，优化的规模只能是持续膨胀
+       * FIXME: 丢弃的机制还不是很明白，还需要进一步分析
+       */
       if (last_marginalization_info){
         std::vector<int> drop_set;
         for (int i = 0; i < static_cast<int>(last_marginalization_parameter_blocks.size()); i++)
@@ -1465,10 +1512,12 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         marginalization_info->addResidualBlockInfo(residual_block_info);
       }
       
-      /* 将IMU预积分相关的残差添加到边缘优化 */
-      /* 注意这里只添加第j帧一帧的IMU预积分代价函数到优化问题 */
-      /* IMU预积分是从i到j之间所有数据的预积分，因此只需要添加一帧即可 */
-      /* 取得指向点云帧的迭代器，并指向第2帧，即第j帧 */
+      /**
+       * @brief 边缘优化第二步：将IMU预积分相关的残差添加到边缘优化
+       * 注意这里只添加第j帧一帧的IMU预积分代价函数到优化问题
+       * IMU预积分是从i到j之间所有数据的预积分，因此只需要添加一帧即可
+       * 取得指向点云帧的迭代器，并指向第2帧，即第j帧
+       */
       auto frame_curr = lidarFrameList.begin();
       std::advance(frame_curr, 1);
 
@@ -1483,10 +1532,13 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                                         std::vector<int>{0, 1});
       marginalization_info->addResidualBlockInfo(residual_block_info);
 
-      /* 对点云列表lidarFrameList中的第一帧点云进行边缘优化 */
-      /* lidarFrameList中的第一帧点云(即此次匹配的第i帧)在此次优化后即将被删除，边缘优化的就是这一帧
-      /* lidarFrameList中的第二帧点云(即此次匹配的第j帧)则会被保留下来作为下次匹配的第i帧 */
-      /* 注意f=0，即取第i帧进行边缘优化 */
+      /**
+       * @brief 边缘优化第三步：将点云到map的代价函数添加到边缘优化
+       * 对点云列表lidarFrameList中的第一帧点云进行边缘优化
+       * lidarFrameList中的第一帧点云(即此次匹配的第i帧)在此次优化后即将被删除，边缘优化的就是这一帧
+       * lidarFrameList中的第二帧点云(即此次匹配的第j帧)则会被保留下来作为下次匹配的第i帧
+       * 注意f=0，即取第i帧进行边缘优化
+       */
       int f = 0;
       transformTobeMapped = Eigen::Matrix4d::Identity();
       transformTobeMapped.topLeftCorner(3,3) = frame_curr->Q * exRbl;
@@ -1560,6 +1612,12 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         }
         cntFtu++;
       }
+
+      /**
+       * @brief 边缘优化第四步：更新边缘优化变量，主要是下面两个：
+       * last_marginalization_info
+       * last_marginalization_parameter_blocks
+       */
 
       /* FIXME:这里的两个操作具体是什么目的不明白 */
       marginalization_info->preMarginalize();

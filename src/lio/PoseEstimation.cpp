@@ -389,7 +389,7 @@ bool TryMAPInitialization() {
     laser_trans_j->imuIntegrator.PreIntegration(laser_trans_i->timeStamp, laser_trans_i->bg, laser_trans_i->ba);
   }
 
-  /* 删除超出滑动窗口的点云帧 */
+  /* 初始化成功后将lidarFrameList中的大部分点云帧删掉，仅保留最新的2帧 */
   // //if IMU success initialized
   WINDOWSIZE = Estimator::SLIDEWINDOWSIZE;
   while(lidarFrameList->size() > WINDOWSIZE){
@@ -418,8 +418,8 @@ void process(){
     double time_curr_lidar = -1;
     Eigen::Matrix3d delta_Rl = Eigen::Matrix3d::Identity();
     Eigen::Vector3d delta_tl = Eigen::Vector3d::Zero();
-	Eigen::Matrix3d delta_Rb = Eigen::Matrix3d::Identity();
-	Eigen::Vector3d delta_tb = Eigen::Vector3d::Zero();
+	  Eigen::Matrix3d delta_Rb = Eigen::Matrix3d::Identity();
+	  Eigen::Vector3d delta_tb = Eigen::Vector3d::Zero();
     std::vector<sensor_msgs::ImuConstPtr> vimuMsg;
   
     while(ros::ok()){
@@ -457,11 +457,16 @@ void process(){
                 }
             }
       
-            /* 初始化当前点云帧 */
+            /* 初始化当前点云帧lidarFrame */
             // this lidar frame init
             Estimator::LidarFrame lidarFrame;
             lidarFrame.laserCloud = laserCloudFullRes;
             lidarFrame.timeStamp = time_curr_lidar;
+
+            /*****************************************************************\
+             * 基于IMU数据的积分获得当前位姿的估计值
+             * 
+            \*****************************************************************/
 
             /* 创建共享指针lidar_list */
             boost::shared_ptr<std::list<Estimator::LidarFrame>> lidar_list;
@@ -488,9 +493,12 @@ void process(){
                     /* 对比初始化和未初始化，再一个重要区别是： */
                     /* 初始化之前，从transformAftMapped获得前一帧位姿，叠加IMU积分增量后获得当前帧的位姿 */
                     /* 初始化之后，从上一帧即lidarFrameList->back()获得前一帧位姿，叠加IMU积分增量后获得当前帧的位姿 */
+                    
+                    /* transformAftMapped保存的是前一帧优化后的位姿，IMU坐标系，简称IMU位姿 */
 
                     // predict current lidar pose
-                    /* 估计雷达的位置P和姿态Q */
+                    /* 估计当前的雷达位姿 */
+                    /* 上一轮优化后的IMU位姿叠加IMU积分增量后获得当前帧的位姿估计 */
                     lidarFrame.P = transformAftMapped.topLeftCorner(3,3) * delta_tb
                                    + transformAftMapped.topRightCorner(3,1);
                     Eigen::Matrix3d m3d = transformAftMapped.topLeftCorner(3,3) * delta_Rb;
@@ -500,6 +508,8 @@ void process(){
                     lidar_list->push_back(lidarFrame);
                     
                 }else{ /* 已经完成初始化 */
+
+                    /* 完成初始化之后，lidarFrameList的长度一直保持为2 */
                 
                     /* FIXME:似乎只有在初始化时才对重力加速度方向GravityVector进行更新，难道不怕方向跑偏？ */
                 
@@ -508,7 +518,7 @@ void process(){
                     lidarFrame.imuIntegrator.PushIMUMsg(vimuMsg);
                     lidarFrame.imuIntegrator.PreIntegration(lidarFrameList->back().timeStamp, lidarFrameList->back().bg, lidarFrameList->back().ba);
 
-                    /* 获得之前（即截至上一点云帧）的IMU在世界坐标系下的位置P、姿态Q、速度V */
+                    /* 获得之前（即截至上一帧云帧）的IMU在世界坐标系下的位置P、姿态Q、速度V */
                     /* Pwbpre中的P表示位置，w表示世界坐标系，b表示IMU，pre表示上一点云帧对应的 */
                     const Eigen::Vector3d& Pwbpre = lidarFrameList->back().P;
                     const Eigen::Quaterniond& Qwbpre = lidarFrameList->back().Q;
@@ -544,8 +554,9 @@ void process(){
                     delta_tb = dP;
 
                     /* 将当前点云帧添加到点云帧列表末尾中，并清除旧列表头端点云 */
-                    /* 从IMU预积分的算法来看，队列中应该始终只有两帧点云：i和j */
                     /* 在IMU_Mode=1（即用IMU进行帧内校正）时lidarFrameList的长度为1 */
+                    /* 在IMU紧耦合模式下，lidarFrameList的长度为2 */
+                    /* 从IMU预积分的算法来看，队列中应该始终只有两帧点云：i和j */
                     lidarFrameList->push_back(lidarFrame);
                     lidarFrameList->pop_front();
                     lidar_list = lidarFrameList;
@@ -565,10 +576,15 @@ void process(){
                 }
             }
 
+            /*****************************************************************\
+             * 基于位姿的估计值进行当前扫描点云到Map的匹配优化，并生成Map
+             * 
+            \*****************************************************************/            
+
             /* 不论IMU是否初始化，下面都会进行扫描点云到Map的匹配优化，从而获得每一帧的位姿，包括lidarFrame.Q、
              * lidarFrame.P、lidarFrame.V等，这样才能在IMU初始化时，基于IMU预积分代价函数，通过优化获得重力加
              * 速度的方向和IMU偏差等，这也是为什么将IMU的初始化TryMAPInitialization()放在最后面的原因，必须等
-             * 到至少有了三帧的点云数据之后才会启动初始化。 */
+             * 到至少有了若干帧的点云数据之后才会启动初始化。 */
             
             /* 点云帧内校正 */
             // remove lidar distortion
@@ -585,13 +601,14 @@ void process(){
             Eigen::Matrix4d transformTobeMapped = Eigen::Matrix4d::Identity();
             transformTobeMapped.topLeftCorner(3,3) = lidar_list->front().Q * exRbl;
             transformTobeMapped.topRightCorner(3,1) = lidar_list->front().Q * exPbl + lidar_list->front().P;
+            /* transformTobeMapped保存的是优化后的位姿，Lidar坐标系，简称优化后的Lidar位姿 */
 
             /* 更新优化后的位姿增量 */
             // update delta transformation
             /* 从优化后的IMU位姿中扣减掉上一帧的IMU位姿，得到优化后的IMU位姿增量 */
             delta_Rb = transformAftMapped.topLeftCorner(3, 3).transpose() * lidar_list->front().Q.toRotationMatrix();
             delta_tb = transformAftMapped.topLeftCorner(3, 3).transpose() * (lidar_list->front().P - transformAftMapped.topRightCorner(3, 1));
-            /* 利用外参将将上一帧的IMU的位姿转成上一帧的Lidar的位姿 */
+            /* 利用外参将上一帧的IMU位姿转成上一帧的Lidar位姿 */
             Eigen::Matrix3d Rwlpre = transformAftMapped.topLeftCorner(3, 3) * exRbl;
             Eigen::Vector3d Pwlpre = transformAftMapped.topLeftCorner(3, 3) * exPbl + transformAftMapped.topRightCorner(3, 1);
             /* 从优化后的Lidar位姿中扣减掉上一帧的Lidar位姿，得到优化后的Lidar位姿增量 */
@@ -621,46 +638,62 @@ void process(){
             laserCloudMsg.header.stamp.fromSec(lidar_list->front().timeStamp);
             pubFullLaserCloud.publish(laserCloudMsg);
 
-            /* 如果尚未完成初始化，则进行初始化 */
+            /*****************************************************************\
+             * 如果是紧耦合IMU模式，并且尚未初始化，则进行初始化
+             * 
+            \*****************************************************************/  
+
+            /* 如果是紧耦合IMU模式，并且尚未初始化，则进行初始化 */
+            /* 初始化之前总共需要处理128帧点云（合并成32帧），每一帧点云都进行了扫描点云到Map的匹配优化，确保每帧点云的 */
+            /* lidarFrame.P、Q、V都有初值，基于这个初值才能在初始化过程中通过优化获得重力加速度方向、IMU偏差等 */
             // if tightly coupled IMU message, start IMU initialization
             if(IMU_Mode > 1 && !LidarIMUInited){
                 // update lidar frame pose
+                /* 用优化后的Lidar位姿更新当前点云帧的位姿 */
+                /* 到这里的每一帧点云都进行了到地图的匹配优化，都获得了优化后的位姿 */
                 lidarFrame.P = transformTobeMapped.topRightCorner(3,1);
                 Eigen::Matrix3d m3d = transformTobeMapped.topLeftCorner(3,3);
                 lidarFrame.Q = m3d;
 
+                /* 每4帧点云向lidarFrameList中添加一帧，累计添加32帧点云（实际处理了32×4=128帧点云）后才具备初始化的条件 */
+                /* 点云、时间戳、优化位姿等都使用最后一帧（即第3帧）的数据，imu则叠加4帧的数据 */
                 // static int pushCount = 0;
                 if(pushCount == 0){
+                    /** 将第0帧点云添加到lidarFrameList中，IMU紧耦合模式下WINDOWSIZE等于20 */
                     lidarFrameList->push_back(lidarFrame);
                     lidarFrameList->back().imuIntegrator.Reset();
-                    if(lidarFrameList->size() > WINDOWSIZE)
+                    if(lidarFrameList->size() > WINDOWSIZE) //确保lidarFrameList中最多只有20帧点云
                         lidarFrameList->pop_front();
                 }else{
-                    lidarFrameList->back().laserCloud = lidarFrame.laserCloud;
-                    lidarFrameList->back().imuIntegrator.PushIMUMsg(vimuMsg);
-                    lidarFrameList->back().timeStamp = lidarFrame.timeStamp;
-                    lidarFrameList->back().P = lidarFrame.P;
+                    /** 将后续若干帧的数据更新到第0帧，唯独imu数据叠加到第0帧 */
+                    lidarFrameList->back().laserCloud = lidarFrame.laserCloud; //点云使用最后一帧的
+                    lidarFrameList->back().imuIntegrator.PushIMUMsg(vimuMsg);  //imu数据叠加
+                    lidarFrameList->back().timeStamp = lidarFrame.timeStamp;   //时间戳使用最后一帧的
+                    lidarFrameList->back().P = lidarFrame.P;                   //位姿使用最后一帧的
                     lidarFrameList->back().Q = lidarFrame.Q;
                 }
                 pushCount++;
                 
-                /* 在收到三帧点云后才能开始初始化 */
-                /* 初始化之前，确保这三帧点云都进行了扫描点云到Map的匹配优化，这三帧优化确保每帧点云的 */
-                /* lidarFrame.P、Q、V都有初值，基于这个初值才能在初始化过程中通过优化获得重力加速度方向、
-                 * IMU偏差等 */
+                /** lidarFrameList每新增一帧点云（实际处理了4帧），进行一次预积分，直到凑齐32帧点云开始初始化 */
                 if (pushCount >= 3){
-                    pushCount = 0;
+                    pushCount = 0; //计数器清零，准备处理下一个4帧
+                    /* lidarFrameList中有2帧以上的点云数据时，则对最新一帧点云（右侧第一个）对应的imu数据进行预积分 */
                     if(lidarFrameList->size() > 1){
-                        auto iterRight = std::prev(lidarFrameList->end());
-                        auto iterLeft = std::prev(std::prev(lidarFrameList->end()));
+                        auto iterRight = std::prev(lidarFrameList->end()); //iterRight指向右侧第一个，即最后一个
+                        auto iterLeft = std::prev(std::prev(lidarFrameList->end())); //iterLeft指向右侧第二个，即倒数第二个
+                        /* 对最新一帧对应的imu数据进行预积分 */
                         iterRight->imuIntegrator.PreIntegration(iterLeft->timeStamp, iterLeft->bg, iterLeft->ba);
                     }
 
+                    /* 紧耦合IMU的模式下WINDOWSIZE等于20 */
+                    /* 当lidarFrameList中有13帧点云的时候，记录当前帧的起始时间到startTime中 */
                     if (lidarFrameList->size() == int(WINDOWSIZE / 1.5)) {
                         startTime = lidarFrameList->back().timeStamp;
                     }
                     
                     /* 开始Map的初始化 */
+                    /* 前提是lidarFrameList中有20帧点云，并且其中最老的点云帧的时间戳要比startTime更新，也就是说总共向lidarFrameList
+                     * 中添加了32帧以上的点云，前面的12帧已经被pop出去，这样才能满足初始化的条件。*/
                     if (!LidarIMUInited && lidarFrameList->size() == WINDOWSIZE && lidarFrameList->front().timeStamp >= startTime){
                         std::cout<<"**************Start MAP Initialization!!!******************"<<std::endl;
                         if(TryMAPInitialization()){
@@ -685,8 +718,10 @@ int main(int argc, char** argv)
 
   ros::param::get("~filter_parameter_corner",filter_parameter_corner);
   ros::param::get("~filter_parameter_surf",filter_parameter_surf);
+  /* IMU模式：0-不使用IMU；1-用IMU数据消除旋转畸变；2-紧耦合IMU，默认值是2 */
   ros::param::get("~IMU_Mode",IMU_Mode);
 	std::vector<double> vecTlb;
+  /* 获得Lidar和IMU之间的外参矩阵，FIXME: 这个外参是如何获得的 */
 	ros::param::get("~Extrinsic_Tlb",vecTlb);
 
   /* 设置雷达和IMU之间的外参 */
@@ -713,12 +748,13 @@ int main(int argc, char** argv)
   ros::Subscriber subFullCloud = nodeHandler.subscribe<sensor_msgs::PointCloud2>("/livox_full_cloud", 10, fullCallBack);
   /* 订阅IMU */
   ros::Subscriber sub_imu;
+  /* 如果使用IMU才订阅IMU数据 */
   if(IMU_Mode > 0)
     sub_imu = nodeHandler.subscribe("/livox/imu", 2000, imu_callback, ros::TransportHints().unreliable());
   if(IMU_Mode < 2)
-    WINDOWSIZE = 1;
+    WINDOWSIZE = 1; //如果仅使用IMU数据去除畸变，则WINDOWSIZE为1
   else
-    WINDOWSIZE = 20;
+    WINDOWSIZE = 20; //如果紧耦合IMU，则WINDOWSIZE为20
 
   /* 发布建图后的完整点云 */
   pubFullLaserCloud = nodeHandler.advertise<sensor_msgs::PointCloud2>("/livox_full_cloud_mapped", 10);

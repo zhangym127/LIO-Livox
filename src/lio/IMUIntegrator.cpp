@@ -49,14 +49,23 @@ const Eigen::Matrix<double, 15, 15>& IMUIntegrator::GetCovariance(){return covar
 
 const Eigen::Matrix<double, 15, 15> & IMUIntegrator::GetJacobian() const {return jacobian;}
 
+/** @brief 添加imu数据到IMU积分模块
+  * @param[in] imu: 单帧imu数据
+  */
 void IMUIntegrator::PushIMUMsg(const sensor_msgs::ImuConstPtr& imu){
   vimuMsg.push_back(imu);
 }
+/** @brief 添加imu数据到IMU积分模块
+  * @param[in] vimu: 多帧imu数据
+  */
 void IMUIntegrator::PushIMUMsg(const std::vector<sensor_msgs::ImuConstPtr>& vimu){
   vimuMsg.insert(vimuMsg.end(), vimu.begin(), vimu.end());
 }
 const std::vector<sensor_msgs::ImuConstPtr> & IMUIntegrator::GetIMUMsg() const {return vimuMsg;}
 
+/** @brief 对已添加的多帧imu数据进行积分，获得姿态增量dq
+  * @param[in] lastTime: imu数据的起始时间
+  */
 void IMUIntegrator::GyroIntegration(double lastTime){
   double current_time = lastTime;
   for(auto & imu : vimuMsg){
@@ -68,6 +77,7 @@ void IMUIntegrator::GyroIntegration(double lastTime){
     ROS_ASSERT(dt >= 0);
     Eigen::Matrix3d dR = Sophus::SO3d::exp(gyr*dt).matrix();
     Eigen::Quaterniond qr(dq*dR);
+    //FIXME: 下面这两行代码是什么意思？
     if (qr.w()<0)
       qr.coeffs() *= -1;
     dq = qr.normalized();
@@ -76,9 +86,9 @@ void IMUIntegrator::GyroIntegration(double lastTime){
 }
 
 /** @brief 对IMU进行预积分，并求得预积分测量噪声的协方差矩阵
-  * @param [in] lastTime 上一帧点云的时间戳
-  * @param [in] bg 上一帧点云对应的角速度偏差
-  * @param [in] ba 上一帧点云对应的加速度偏差
+  * @param[in] lastTime: 上一帧点云的时间戳
+  * @param[in] bg: 上一帧点云对应的角速度偏差
+  * @param[in] ba: 上一帧点云对应的加速度偏差
   */
 void IMUIntegrator::PreIntegration(double lastTime, const Eigen::Vector3d& bg, const Eigen::Vector3d& ba){
   Reset();
