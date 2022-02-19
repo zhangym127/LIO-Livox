@@ -86,6 +86,7 @@ void IMUIntegrator::GyroIntegration(double lastTime){
 }
 
 /** @brief 对IMU进行预积分，并求得预积分测量噪声的协方差矩阵
+  *   需要特别注意的是，对IMU的加速度也进行了积分，这是IMU预积分的特色
   * @param[in] lastTime: 上一帧点云的时间戳
   * @param[in] bg: 上一帧点云对应的角速度偏差
   * @param[in] ba: 上一帧点云对应的加速度偏差
@@ -145,8 +146,9 @@ void IMUIntegrator::PreIntegration(double lastTime, const Eigen::Vector3d& bg, c
     B.block<3,3>(6,3) = dq.matrix()*dt;
     B.block<3,3>(9,6) = Eigen::Matrix3d::Identity()*dt;
     B.block<3,3>(12,9) = Eigen::Matrix3d::Identity()*dt;
+    /* 求得预积分测量噪声的雅可比矩阵，将在构造IMU预积分代价函数的时候用于相邻两帧点云之间位姿增量测量值的计算，避免重新积分 */
     jacobian = A * jacobian;
-    /* 求得预积分测量噪声的协方差矩阵 */
+    /* 求得预积分测量噪声的协方差矩阵，将在构造IMU预积分代价函数的时候用于构造信息矩阵，在残差上左乘信息矩阵能够起到平衡权重的作用 */
     covariance = A * covariance * A.transpose() + B * noise * B.transpose();
 
     /* 下面是对dp、dv、dq的积分，与A、B无关，很容易理解 */

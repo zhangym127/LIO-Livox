@@ -321,7 +321,7 @@ public:
  *  @brief IMU预积分代价函数
  *  @param [in] measure_ 当前帧的IMUIntegrator，从中获得IMU测量值
  *  @param [in] GravityVec_ 重力加速度向量
- *  @param [in] sqrt_information_ 具体的含义还不清楚，来自IMU测量噪声协方差矩阵的分解
+ *  @param [in] sqrt_information_ IMU预积分测量噪声协方差矩阵的平方根
  */
 struct Cost_NavState_PRV_Bias
 {
@@ -333,65 +333,75 @@ struct Cost_NavState_PRV_Bias
 					sqrt_information(std::move(sqrt_information_)){}
 
 /** @brief 雷达位姿和IMU预积分之间的代价函数
-  * @param [in] pri_        第i帧点云对应的位置姿态
-  * @param [in] velobiasi   第i帧点云对应的位置姿态帧点云对应的速度偏差
-  * @param [in] prj_        第j帧点云对应的位置姿态
-  * @param [in] velobiasj_  第j帧点云对应的速度偏差
+  * @param [in] pri_        第i帧点云对应的位姿
+  * @param [in] velobiasi   第i帧点云对应的速度和偏差
+  * @param [in] prj_        第j帧点云对应的位姿
+  * @param [in] velobiasj_  第j帧点云对应的速度和偏差
   * @param [out] residual   残差
   */
 	template <typename T>
 	bool operator()( const T *pri_, const T *velobiasi_, const T *prj_, const T *velobiasj_, T *residual) const {
-    /* 以矩阵的方式访问C++数组pri_，分别获得位置Pi和姿态Ri */
+
+		/**
+		 * @brief 第一步：从输入参数（数组形式）取得所有待优化变量：Pi,Pj,Ri,Rj,Vi,Vj,dbgi,dbai
+		 */
+
+    	/* 以矩阵的方式访问C++数组pri_，分别获得位置Pi和姿态Ri */
         Eigen::Map<const Eigen::Matrix<T, 6, 1>> PRi(pri_);
 		Eigen::Matrix<T, 3, 1> Pi = PRi.template segment<3>(0);
 		Sophus::SO3<T> SO3_Ri = Sophus::SO3<T>::exp(PRi.template segment<3>(3));
-    /* 获得位置Pj和姿态Rj */
+    	/* 获得位置Pj和姿态Rj */
 		Eigen::Map<const Eigen::Matrix<T, 6, 1>> PRj(prj_);
 		Eigen::Matrix<T, 3, 1> Pj = PRj.template segment<3>(0);
 		Sophus::SO3<T> SO3_Rj = Sophus::SO3<T>::exp(PRj.template segment<3>(3));
-    /* 获得速度Vi和偏差增量dbgi、dbai */
+    	/* 获得速度Vi和偏差增量dbgi、dbai */
 		Eigen::Map<const Eigen::Matrix<T, 9, 1>> velobiasi(velobiasi_);
 		Eigen::Matrix<T, 3, 1> Vi = velobiasi.template segment<3>(0);
 		Eigen::Matrix<T, 3, 1> dbgi = velobiasi.template segment<3>(3) - imu_measure.GetBiasGyr().cast<T>();
 		Eigen::Matrix<T, 3, 1> dbai = velobiasi.template segment<3>(6) - imu_measure.GetBiasAcc().cast<T>();
-    /* 获得速度Vj */
+    	/* 获得速度Vj */
 		Eigen::Map<const Eigen::Matrix<T, 9, 1>> velobiasj(velobiasj_);
 		Eigen::Matrix<T, 3, 1> Vj = velobiasj.template segment<3>(0);
 
 		Eigen::Map<Eigen::Matrix<T, 15, 1> > eResiduals(residual);
 		eResiduals = Eigen::Matrix<T, 15, 1>::Zero();
 
-    /* 求i、j两帧之间的dt和dt^2 */
+    	/* 求i、j两帧之间的dt和dt^2 */
 		T dTij = T(imu_measure.GetDeltaTime());
 		T dT2 = dTij*dTij;
-    /* 求i、j两帧之间的位置增量dPij，速度增量dVij，姿态增量dRij */
+    	/* 求i、j两帧之间的位置增量dPij，速度增量dVij，姿态增量dRij */
 		Eigen::Matrix<T, 3, 1> dPij = imu_measure.GetDeltaP().cast<T>();
 		Eigen::Matrix<T, 3, 1> dVij = imu_measure.GetDeltaV().cast<T>();
 		Sophus::SO3<T> dRij = Sophus::SO3<T>(imu_measure.GetDeltaQ().cast<T>());
 		Sophus::SO3<T> RiT = SO3_Ri.inverse();
 
-    /* 求残差第一项rPij：雷达位置增量和IMU预积分位置增量之差 */
-    /* 下面第1行求雷达位置增量 */
-    /* 下面第2、3行在IMU预积分位置增量dPij的基础上叠加角速度和加速度偏差 */
-    /* FIXME: 第一行RiT*(……)的结果似乎就是dPij，就是PoseEstimation中求第j帧lidarFrame.P的逆过程
-      然后rPij实际上就变成了两个偏差之和？ */
+		/**
+		 * @brief 第二步：计算残差 rPij，rRij，rVij
+		 *   残差的计算公式与邱笑晨《IMU预积分总结与公式推导》第六章中提到的残差公式完全一致
+		 *   公式的由两部分组成，第一部分是非IMU方式的估计值，先验来自IMU积分，后验来自上一周期的点云到地图的优化
+		 *   第二部分是IMU预积分的测量值，包含有近似的修正值，用到了测量噪声雅可比矩阵
+		 */
+
+		/* 求残差第一项rPij：雷达位置增量和IMU预积分位置增量之差 */
+		/* 第1行是非IMU方式的估计值，先验来自IMU积分，后验来自上一周期的优化 */
+		/* 第2、3行是IMU预积分的测量值，包含有近似的修正值 */
 		Eigen::Matrix<T, 3, 1> rPij = RiT*(Pj - Pi - Vi*dTij - 0.5*GravityVec.cast<T>()*dT2) -
 						(dPij + imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_P, IMUIntegrator::O_BG).cast<T>()*dbgi +
 						imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_P, IMUIntegrator::O_BA).cast<T>()*dbai);
 
-    /* 求残差第二项rPhiij：雷达姿态增量和IMU预积分姿态增量之差*/
-    /* (RiT * SO3_Rj)即是Rj乘以Ri的逆，得到雷达的姿态增量 */
-    /* dRij是IMU预积分姿态增量，叠加偏差dR_dbg后得到IMU预积分姿态增量 */
-    /* IMU预积分姿态增量求逆，再乘以雷达的姿态增量，得到两者之差 */
-    /* 姿态增量之差通过对数映射转成李代数，即向量的形式 */
+    	/* 求残差第二项rPhiij：雷达姿态增量和IMU预积分姿态增量之差*/
+    	/* (RiT * SO3_Rj)即是Rj乘以Ri的逆，得到雷达的姿态增量 */
+    	/* dRij是IMU预积分姿态增量，叠加偏差dR_dbg后得到IMU预积分姿态增量 */
+    	/* IMU预积分姿态增量求逆，再乘以雷达的姿态增量，得到两者之差 */
+    	/* 姿态增量之差通过对数映射转成李代数，即向量的形式 */
 		Sophus::SO3<T> dR_dbg = Sophus::SO3<T>::exp(
 						imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_R, IMUIntegrator::O_BG).cast<T>()*dbgi);
 		Sophus::SO3<T> rRij = (dRij * dR_dbg).inverse() * RiT * SO3_Rj;
 		Eigen::Matrix<T, 3, 1> rPhiij = rRij.log();
 
-    /* 求残差第三项rVij：雷达速度增量和IMU预积分速度增量之差 */
-    /* RiT*(……)即是PoseEstimation中求第j帧lidarFrame.V的逆过程，求得雷达的速度增量 */
-    /* 下面第2、3行在IMU预积分速度增量的基础上叠加偏差，得到IMU预积分速度增量 */
+    	/* 求残差第三项rVij：雷达速度增量和IMU预积分速度增量之差 */
+    	/* RiT*(……)即是PoseEstimation中求第j帧lidarFrame.V的逆过程，求得雷达的速度增量 */
+    	/* 下面第2、3行在IMU预积分速度增量的基础上叠加偏差，得到IMU预积分速度增量 */
 		Eigen::Matrix<T, 3, 1> rVij = RiT*(Vj - Vi - GravityVec.cast<T>()*dTij) -
 						(dVij + imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_V, IMUIntegrator::O_BG).cast<T>()*dbgi +
 										imu_measure.GetJacobian().block<3,3>(IMUIntegrator::O_V, IMUIntegrator::O_BA).cast<T>()*dbai);
@@ -399,13 +409,19 @@ struct Cost_NavState_PRV_Bias
 		eResiduals.template segment<3>(0) = rPij;
 		eResiduals.template segment<3>(3) = rPhiij;
 		eResiduals.template segment<3>(6) = rVij;
-    /* 残差第四项：第i,j两帧的偏差之差*/
-    /* segment<6>(3)表示从velobiasj的第3个元素开始，取6个，即偏差部分 */
+
+    	/* 残差第四项：第i,j两帧的偏差之差*/
+    	/* segment<6>(3)表示从velobiasj的第3个元素开始，取6个，即偏差部分 */
 		eResiduals.template segment<6>(9) = velobiasj.template segment<6>(3) - velobiasi.template segment<6>(3);
 
-    /* FIXME:这里为什么要用信息矩阵去左乘残差不明白 */
-    /* 这里的sqrt_information就是对IMU预积分测量噪声的协方差矩阵的逆矩阵进行Cholesky分解，然后获得的L矩阵的转置 */
-    /* Cholesky分解本质上是对矩阵进行开方，下三角矩阵L即是原矩阵的平方根 */
+		/**
+		 * @brief 第三步：残差左乘信息矩阵
+		 *  -所谓信息矩阵是指IMU预积分测量噪声协方差矩阵的平方根
+		 *  -协方差矩阵的平方根通过对协方差矩阵进行Cholesky分解获得，下三角矩阵L即是原矩阵的平方根
+		 *  -在残差上左乘信息矩阵能够起到平衡权重的作用。优化过程中误差只是减少并不是完全消除，不能消除的误差去哪里呢？
+		 *  -当然是每条边（因子图）分摊了，但是每条边都分摊一样多的误差显然是不科学的，这个时候就需要信息矩阵，它表达
+		 *   了每条边要分摊的误差比例。
+		 */
 		eResiduals.applyOnTheLeft(sqrt_information.template cast<T>());
 
 		return true;

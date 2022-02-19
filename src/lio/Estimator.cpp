@@ -1191,7 +1191,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     vector2double(lidarFrameList);
 
     /* 创建huber损失函数 */
-    /* FIXME:为什么windowSize等于2的时候要清空损失函数，而且还存在内存泄露的嫌疑 */
+    /** FIXME:为什么windowSize等于2的时候要清空损失函数，而且还存在内存泄露的嫌疑 */
     //create huber loss function
     ceres::LossFunction* loss_function = NULL;
     loss_function = new ceres::HuberLoss(0.1 / IMUIntegrator::lidar_m);
@@ -1230,6 +1230,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       /* Eigen::LLT表示对矩阵进行Cholesky分解，然后通过matrixL()方法获得分解后的下三角矩阵L */
       /* 这里是对IMU预积分测量噪声的协方差矩阵的逆矩阵进行Cholesky分解，然后获得L矩阵的转置 */
       /* Cholesky分解本质上是对矩阵进行开方，下三角矩阵L即是原矩阵的平方根 */
+      /* 也就是将IMU预积分测量噪声协方差矩阵的平方根传入代价函数 */
       problem.AddResidualBlock(Cost_NavState_PRV_Bias::Create(frame_curr->imuIntegrator,
                                                               const_cast<Eigen::Vector3d&>(gravity),
                                                               Eigen::LLT<Eigen::Matrix<double, 15, 15>>
