@@ -1487,8 +1487,12 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
 
     /**
      * @brief 优化第六步：开展边缘化
-     * 边缘化的内容是全新的内容，总共四个步骤，理解有一定的难度，尤其是第一步和第四步。
-     * FIXME: 还需要进一步的深入研究
+     * 
+     * 这里的边缘化和BA的边缘化不太一样，这里的边缘化仅仅是对滑动窗口中的第0帧进行单独优化，该帧在本周期边缘化之后就永远
+     * 的退出优化序列，下一周期不再对其进行优化。每周期的优化仅限于滑动窗口中的帧，过往的帧对当前滑动窗口的优化没有任何影
+     * 响，因此还不能叫做严格意义上的图优化，只能叫做是基于滑动窗口的局部优化。
+     * 
+     * BA中的边缘化指的是利用矩阵的稀疏结构求解线性方程组H△x=g的方法叫做边缘化。
      */
 
     /* 位姿增量小于阈值或达到最大迭代次数，停止 */
@@ -1496,13 +1500,6 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       ROS_INFO("Frame: %d\n",frame_count++);
       if(windowSize != SLIDEWINDOWSIZE) break;
       
-      /**
-       * @brief 开展边缘化。
-       * 
-       * 这里的边缘化和
-       * 所谓边缘化是指，将此次优化后的状态变量，以及代价函数添加到下一次优化中继续优化，以获得更高的精度 */
-      /* 也就是说，每次实际上是有多帧点云参与优化 */
-
       // apply marginalization
       /* 更新本轮的边缘信息，准备存储待优化的状态变量和代价函数 */
       auto *marginalization_info = new MarginalizationInfo();

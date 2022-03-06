@@ -15,8 +15,7 @@ const int NUM_THREADS = 4;
 struct ResidualBlockInfo
 {
 	/**
-	 * @brief Construct a new Residual Block Info object
-	 *        构造一个新的残差块块信息对象
+	 * @brief 构造用于边缘化的残差块
 	 * @param _cost_function 代价函数，或说边缘化因子
 	 * @param _loss_function 鲁邦核函数指针
 	 * @param _parameter_blocks 参数块，即para_PR或para_VBias
@@ -27,20 +26,25 @@ struct ResidualBlockInfo
 
 	/**
 	 * @brief 对残差块进行优化
-	 * 
 	 */
 	void Evaluate(){
+
+		/* 初始化残差 */
 		residuals.resize(cost_function->num_residuals());
 
+		/* 根据参数块的数量初始化雅可比长度 */
 		std::vector<int> block_sizes = cost_function->parameter_block_sizes();
 		raw_jacobians = new double *[block_sizes.size()];
 		jacobians.resize(block_sizes.size());
 
+		/* 用每个参数块的size初始化每个雅可比的size */
 		for (int i = 0; i < static_cast<int>(block_sizes.size()); i++)
 		{
 			jacobians[i].resize(cost_function->num_residuals(), block_sizes[i]);
 			raw_jacobians[i] = jacobians[i].data();
 		}
+
+		/* 调用代价函数进行优化 */
 		cost_function->Evaluate(parameter_blocks.data(), residuals.data(), raw_jacobians);
 
 		/* 使用鲁棒核函数对残差的比例进行调节，防止错误的测量值带偏优化结果 */
@@ -50,9 +54,19 @@ struct ResidualBlockInfo
 
 			double sq_norm, rho[3];
 
+			/* 求残差序列的平方和 */
 			sq_norm = residuals.squaredNorm();
+			
+			/** 
+			 * 鲁棒核函数对于输入的非负标量s，返回三个值：ρ(s)、ρ'(s)、ρ"(s)，其中ρ()就是鲁棒核函数，第2、3项分别是其一阶和二阶导数。
+			 * 下面Evaluate函数的第一个参数sq_norm就是非负标量s，rho[]就是ρ(s)、ρ'(s)、ρ"(s)
+			 * Ceres官方手册讲：如果二阶导数小于0，则“in the outlier region”，具体含义还不是很清楚。
+			 */
 			loss_function->Evaluate(sq_norm, rho);
 
+			/**
+			 * FIXME: 下面通过鲁棒核函数返回的ρ(s)、ρ'(s)、ρ"(s)来计算残差比例的算法不是很明白，也没有找到出处
+			 */
 			double sqrt_rho1_ = sqrt(rho[1]);
 
 			if ((sq_norm == 0.0) || (rho[2] <= 0.0))
@@ -68,11 +82,13 @@ struct ResidualBlockInfo
 				alpha_sq_norm_ = alpha / sq_norm;
 			}
 
+			/* 用计算好的残差比例对雅可比进行修正 */
 			for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++)
 			{
 				jacobians[i] = sqrt_rho1_ * (jacobians[i] - alpha_sq_norm_ * residuals * (residuals.transpose() * jacobians[i]));
 			}
 
+			/* 用计算好的残差比例对残差进行修正，防止异常值带偏优化结果 */
 			residuals *= residual_scaling_;
 		}
 	}
@@ -173,9 +189,9 @@ public:
 
 	/**
 	 * @brief 预边缘化
-	 *        遍历所有因子及其参数块
-	 *        将新增的参数块添加到parameter_block_data中
-	 *        parameter_block_data中的参数块都重新分配了空间，参数块的地址已经发生变化
+	 *        遍历所有因子及其参数块，对因子进行优化，计算残差
+	 *        将新增的参数块添加到parameter_block_data中，滑动窗口长度为2的情况下，添加的参数块总数就是4，
+	 * 　　　　即：para_PR[0],para_PR[1],para_VBias[0],para_VBias[1]
 	 */
 	void preMarginalize(){
 
@@ -196,8 +212,6 @@ public:
 				if (parameter_block_data.find(addr) == parameter_block_data.end())
 				{
 					/* 没找到该参数块，则添加该参数块到parameter_block_data中 */
-					/** FIXME: 这里已经为参数块重新分配了空间，地址已经发生变化，但是添加到parameter_block_data
-					 * 时用的仍然是旧的地址，为什么不用新的地址？ */
 					double *data = new double[size];
 					memcpy(data, it->parameter_blocks[i], sizeof(double) * size);
 					parameter_block_data[addr] = data;
@@ -270,6 +284,11 @@ public:
 		/* n等于此次新增参数块的size之和，即所有参数块的结束位置 */
 		n = pos - m;
 
+		/**
+		 * 下面启动四个线程开始计算linearized_jacobians和linearized_residuals的值，从表面来看使用了两次
+		 * 求解特征值和特征向量。
+		 * FIXME: 这里计算linearized_jacobians和linearized_residuals的值的目的、算法是什么？
+		 */
 		Eigen::MatrixXd A(pos, pos);
 		Eigen::VectorXd b(pos);
 		A.setZero();
@@ -284,6 +303,7 @@ public:
 			i++;
 			i = i % NUM_THREADS;
 		}
+		/* 启动四个线程计算A和b */
 		for (int i = 0; i < NUM_THREADS; i++)
 		{
 			threadsstruct[i].A = Eigen::MatrixXd::Zero(pos,pos);
@@ -304,6 +324,7 @@ public:
 			b += threadsstruct[i].b;
 		}
 		Eigen::MatrixXd Amm = 0.5 * (A.block(0, 0, m, m) + A.block(0, 0, m, m).transpose());
+		/* 对矩阵Amm求解特征值和特征向量 */
 		Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> saes(Amm);
 
 		Eigen::MatrixXd Amm_inv = saes.eigenvectors() * Eigen::VectorXd((saes.eigenvalues().array() > eps).select(saes.eigenvalues().array().inverse(), 0)).asDiagonal() * saes.eigenvectors().transpose();
@@ -316,6 +337,7 @@ public:
 		A = Arr - Arm * Amm_inv * Amr;
 		b = brr - Arm * Amm_inv * bmm;
 
+		/* 对矩阵A求解特征值和特征向量 */
 		Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> saes2(A);
 		Eigen::VectorXd S = Eigen::VectorXd((saes2.eigenvalues().array() > eps).select(saes2.eigenvalues().array(), 0));
 		Eigen::VectorXd S_inv = Eigen::VectorXd((saes2.eigenvalues().array() > eps).select(saes2.eigenvalues().array().inverse(), 0));
@@ -381,7 +403,12 @@ public:
 	/* m之前是要丢弃的，m和n之间是要留到下一周期的参数块 */
 	int m, n;
 	
-	/* 缓存本周期边缘化参数块的变量 */
+	/**
+	 * 缓存本周期边缘化参数块的变量，parameter_block相关的三个变量全都是map类型，三个变量都以参数块的
+	 * 地址做key来分别存放参数块的size、索引和数据。需要注意的是这三个变量都使用para_PR和para_VBias的
+	 * 地址做key，当滑动窗口长度为2的时候，总共只有四个参数块及其地址：para_PR[0]、para_VBias[0]、
+	 * para_PR[1]、para_VBias[1]。
+	 */
 	std::unordered_map<long, int> parameter_block_size; //key是参数块的地址，value是参数块的大小
 	int sum_block_size;
 	std::unordered_map<long, int> parameter_block_idx;  //key是参数块的地址，value是参数块的索引
@@ -472,7 +499,11 @@ public:
 			 */
 		}
 		
-		/* 更新残差 */
+		/**
+		 * 更新残差，注意这里除了上面计算出来的前后两周期优化结果的残差dx，还用到了linearized_residuals和linearized_jacobians，
+		 * 这两个值是在marginalize()中启动四个线程并行计算出来的。
+		 * FIXME: 这两个线性值是怎么计算出来的，为什么残差的计算公式是这样，还不是很明白。 
+		 */
 		Eigen::Map<Eigen::VectorXd>(residuals, n) = marginalization_info->linearized_residuals + marginalization_info->linearized_jacobians * dx;
 		
 		/* 更新雅可比 */
