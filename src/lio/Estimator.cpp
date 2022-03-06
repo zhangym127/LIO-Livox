@@ -1193,6 +1193,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     /* 创建huber损失函数 */
     /** FIXME:为什么windowSize等于2的时候要清空损失函数，而且还存在内存泄露的嫌疑 */
     //create huber loss function
+    /* 创建鲁棒核函数，防止个别错误数据把整个优化方向带偏 */
     ceres::LossFunction* loss_function = NULL;
     loss_function = new ceres::HuberLoss(0.1 / IMUIntegrator::lidar_m);
     if(windowSize == SLIDEWINDOWSIZE) {
@@ -1244,10 +1245,21 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     }
 
     /**
-     * @brief 优化第三步：进行边缘优化
-     * 每一轮都有两帧点云参与优化，分别是i和j
-     * 将上一轮中的第i帧对应的状态变量及其代价函数加入到当前帧的优化问题中进行同步优化，以获得更高精度
-     * 因此实际上每一轮都有三帧点云参与优化
+     * @brief 优化第三步：防止某节点（点云）的当前优化结果与上一周期的优化结果脱节
+     * 
+     * 由于使用了滑动窗口的机制，每一帧点云都要参与多个周期的优化，具体的优化次数取决于滑动窗口的长度，
+     * 当滑动窗口的长度为2时，每帧点云参与优化的次数就是2。
+     * 
+     * 为了防止同一个节点（点云）状态（位姿）的多次优化结果相互脱节，需要设计一种代价函数（因子）把它们拉住，
+     * MarginalizationFactor就是这个防止脱节的因子。
+     * 
+     * MarginalizationFactor是一个重载的代价函数，它将某个节点当前周期的优化结果与上一周期优化结果之差作
+     * 为残差进行迭代优化。
+     * 
+     * last_marginalization_info中保存着上一周期第j帧参数块的优化结果，在创建因子的时候就作为参数传进去。
+     * 
+     * last_marginalization_parameter_blocks中是上一周期第j帧参数块在本周期即第i帧对应的参数块地址，即
+     * para_PR[0]和para_VBias[0]的地址，存放着本周期的优化结果，并且在持续迭代更新中
      */
     if (last_marginalization_info){
       // construct new marginlization_factor
@@ -1452,6 +1464,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
 
     /* 开始优化 */
     ceres::Solver::Options options;
+    /* 采用类似BA问题那样的Schur消元法求解线性方程组 */
     options.linear_solver_type = ceres::DENSE_SCHUR;
     options.trust_region_strategy_type = ceres::DOGLEG;
     options.max_num_iterations = 10;
@@ -1473,8 +1486,8 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
     double deltaT = (t_before_opti - t_after_opti).norm();
 
     /**
-     * @brief 优化第六步：开始准备下一轮优化的边缘优化数据准备
-     * 边缘优化的内容是全新的内容，总共四个步骤，理解有一定的难度，尤其是第一步和第四步。
+     * @brief 优化第六步：开展边缘化
+     * 边缘化的内容是全新的内容，总共四个步骤，理解有一定的难度，尤其是第一步和第四步。
      * FIXME: 还需要进一步的深入研究
      */
 
@@ -1483,8 +1496,11 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       ROS_INFO("Frame: %d\n",frame_count++);
       if(windowSize != SLIDEWINDOWSIZE) break;
       
-      /* 开展边缘优化 */
-      /* 所谓边缘优化是指，将此次优化后的状态变量，以及代价函数添加到下一次优化中继续优化，以获得更高的精度 */
+      /**
+       * @brief 开展边缘化。
+       * 
+       * 这里的边缘化和
+       * 所谓边缘化是指，将此次优化后的状态变量，以及代价函数添加到下一次优化中继续优化，以获得更高的精度 */
       /* 也就是说，每次实际上是有多帧点云参与优化 */
 
       // apply marginalization
@@ -1492,20 +1508,46 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       auto *marginalization_info = new MarginalizationInfo();
 
       /**
-       * @brief 边缘优化第一步：将上一轮边缘优化的代价函数和待优化参数再次添加到边缘优化中
-       * 需要注意的是，这里设置了drop_set，即有部分内容是要丢弃的，并不是完全将之前的内容完全添加到下一轮优化中
-       * 否则，优化的规模只能是持续膨胀
-       * FIXME: 丢弃的机制还不是很明白，还需要进一步分析
+       * @brief 边缘化第一步：将防止脱节的因子添加到边缘化，防止某节点（点云）的边缘化结果与本周期前面的优化结
+       * 果脱节。同时将滑动窗口中最老的一个节点所对应的参数块标识为丢弃状态，阻止该节点的状态进入下一周期的优化。
        */
       if (last_marginalization_info){
         std::vector<int> drop_set;
         for (int i = 0; i < static_cast<int>(last_marginalization_parameter_blocks.size()); i++)
         {
+          /**
+           * 将滑动窗口中最早的节点（即第i帧）所对应的参数块标识为丢弃状态，阻止该参数块进入下一周期的优化。
+           * last_marginalization_parameter_blocks中是参与上一周期优化的节点在本周期对应参数块的地址，在
+           * 滑动窗口长度等于2的情况下，其中只有1个节点即上周期第j帧本周期第i帧对应参数块的地址，即para_PR[0]
+           * 和para_VBias[0]的地址，这两个参数块被被标识为丢弃，标识将不会参与下一周期的优化。
+           */
           if (last_marginalization_parameter_blocks[i] == para_PR[0] ||
               last_marginalization_parameter_blocks[i] == para_VBias[0])
             drop_set.push_back(i);
+            /* last_marginalization_parameter_blocks中与para_PR[0]和para_VBias[0]对应的参数块被丢弃 */
         }
 
+        /**
+         * @brief 防止某节点（点云）的当前边缘化结果与前面的优化结果脱节
+         * 
+         * 由于使用了滑动窗口的机制，每一帧点云都要参与多个周期的优化，具体的优化次数取决于滑动窗口的长度，
+         * 当滑动窗口的长度为2时，每帧点云参与优化的次数就是2。
+         * 
+         * 之外，每周期除了正常优化之外还有边缘化，因此每一帧点云在一个周期内就要进行多次优化。
+         * 
+         * 为了防止同一个节点（点云）状态（位姿）的多次优化结果相互脱节，需要设计一种代价函数（因子）把它们拉住，
+         * MarginalizationFactor就是这个防止脱节的因子。
+         * 
+         * MarginalizationFactor是一个重载的代价函数，它将某个节点当前周期的优化结果与上一周期优化结果之差作
+         * 为残差进行迭代优化。
+         * 
+         * last_marginalization_info中保存着上一周期第j帧（滑动窗口长度为2）参数块的优化结果，在创建因子的时
+         * 候就作为参数传进去。如果滑动窗口长度＞n，则其中应该保存n-1帧参数块的优化结果。
+         * 
+         * last_marginalization_parameter_blocks中是上一周期第j帧参数块在本周期即第i帧对应的参数块地址，即
+         * para_PR[0]和para_VBias[0]的地址，存放着本周期的优化结果，并且在持续迭代更新中。如果滑动窗口长度＞n，
+         * 则其中应该保存n-1帧参数块在本周期对应的参数块地址。
+         */
         auto *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
         auto *residual_block_info = new ResidualBlockInfo(marginalization_factor, nullptr,
                                                           last_marginalization_parameter_blocks,
@@ -1514,15 +1556,20 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       }
       
       /**
-       * @brief 边缘优化第二步：将IMU预积分相关的残差添加到边缘优化
-       * 注意这里只添加第j帧一帧的IMU预积分代价函数到优化问题
-       * IMU预积分是从i到j之间所有数据的预积分，因此只需要添加一帧即可
-       * 取得指向点云帧的迭代器，并指向第2帧，即第j帧
+       * @brief 边缘化第二步：将IMU预积分代价函数添加到边缘化，对滑动窗口中最老的两帧之间的IMU数据进行边缘化
+       * 注意这里只添加第2帧的IMU预积分代价函数到优化问题，IMU预积分是从i到j之间所有数据的预积分，因此只需要
+       * 添加一帧即可。下面取得指向点云帧的迭代器，并指向第2帧，即第j帧。
        */
       auto frame_curr = lidarFrameList.begin();
       std::advance(frame_curr, 1);
 
-      /* 添加IMU预积分的代价函数，其中包含了状态变量para_PR和para_VBias */
+      /**
+       * 添加IMU预积分的代价函数到边缘化，对滑动窗口中最老的两帧进行边缘化。
+       * 这里添加的IMU预积分代价函数与前面添加的完全一致，主要的区别有两点：
+       * 1. 只添加了滑动窗口的前两帧（0、1）到边缘化；
+       * 2. 前面的代价函数采用ceres::Solve进行优化，而这里由marginalization_info->preMarginalize()和
+       * marginalization_info->marginalize()负责边缘化。
+       */
       ceres::CostFunction* IMU_Cost = Cost_NavState_PRV_Bias::Create(frame_curr->imuIntegrator,
                                                                      const_cast<Eigen::Vector3d&>(gravity),
                                                                      Eigen::LLT<Eigen::Matrix<double, 15, 15>>
@@ -1530,22 +1577,22 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                                                              .matrixL().transpose());
       auto *residual_block_info = new ResidualBlockInfo(IMU_Cost, nullptr,
                                                         std::vector<double *>{para_PR[0], para_VBias[0], para_PR[1], para_VBias[1]},
-                                                        std::vector<int>{0, 1});
+                                                        std::vector<int>{0, 1}); //将para_PR[0], para_VBias[0]添加到drop_set
       marginalization_info->addResidualBlockInfo(residual_block_info);
 
       /**
-       * @brief 边缘优化第三步：将点云到map的代价函数添加到边缘优化
-       * 对点云列表lidarFrameList中的第一帧点云进行边缘优化
-       * lidarFrameList中的第一帧点云(即此次匹配的第i帧)在此次优化后即将被删除，边缘优化的就是这一帧
+       * @brief 边缘化第三步：将点云到map的代价函数添加到边缘化
+       * 对点云列表lidarFrameList中的第一帧点云进行边缘化
+       * lidarFrameList中的第一帧点云(即此次匹配的第i帧)在此次优化后即将被删除，边缘化的就是这一帧
        * lidarFrameList中的第二帧点云(即此次匹配的第j帧)则会被保留下来作为下次匹配的第i帧
-       * 注意f=0，即取第i帧进行边缘优化
+       * 注意f=0，即只取滑动窗口中的第1帧进行边缘化
        */
       int f = 0;
       transformTobeMapped = Eigen::Matrix4d::Identity();
       transformTobeMapped.topLeftCorner(3,3) = frame_curr->Q * exRbl;
       transformTobeMapped.topRightCorner(3,1) = frame_curr->Q * exPbl + frame_curr->P;
       
-      /* 分别求第i帧的角点、平面点、不规则特征点云到Map的代价函数 */
+      /* 分别求第0帧的角点、平面点、不规则特征点云到Map的代价函数 */
       /* 与前面不同的是，此时已经完成主体优化，状态变量的估计值已经变成了优化值 */
       edgesLine[f].clear();
       edgesPlan[f].clear();
@@ -1581,13 +1628,13 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       threads[1].join();
       threads[2].join();
 
-      /* 将状态变量及代价函数添加到边缘优化 */
+      /* 将状态变量及代价函数添加到边缘化 */
       int cntFtu = 0;
       for (auto &e : edgesLine[f]) {
         if(vLineFeatures[f][cntFtu].valid){
           auto *residual_block_info = new ResidualBlockInfo(e, nullptr,
                                                             std::vector<double *>{para_PR[0]},
-                                                            std::vector<int>{0});
+                                                            std::vector<int>{0}); //将para_PR[0]添加到drop_set
           marginalization_info->addResidualBlockInfo(residual_block_info);
         }
         cntFtu++;
@@ -1597,7 +1644,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         if(vPlanFeatures[f][cntFtu].valid){
           auto *residual_block_info = new ResidualBlockInfo(e, nullptr,
                                                             std::vector<double *>{para_PR[0]},
-                                                            std::vector<int>{0});
+                                                            std::vector<int>{0}); //将para_PR[0]添加到drop_set
           marginalization_info->addResidualBlockInfo(residual_block_info);
         }
         cntFtu++;
@@ -1608,34 +1655,47 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
         if(vNonFeatures[f][cntFtu].valid){
           auto *residual_block_info = new ResidualBlockInfo(e, nullptr,
                                                             std::vector<double *>{para_PR[0]},
-                                                            std::vector<int>{0});
+                                                            std::vector<int>{0}); //将para_PR[0]添加到drop_set
           marginalization_info->addResidualBlockInfo(residual_block_info);
         }
         cntFtu++;
       }
 
       /**
-       * @brief 边缘优化第四步：更新边缘优化变量，主要是下面两个：
-       * last_marginalization_info
-       * last_marginalization_parameter_blocks
+       * @brief 边缘化第四步：开展预边缘化和边缘化：
+       * 这里的边缘化和BA的边缘化似乎不一样，这里的边缘化仅仅是对滑动窗口中的第0帧进行优化，该帧在本周期边缘化之后就永远
+       * 的退出优化序列，下一周期不再对其进行优化，不论是正常优化还是边缘化都仅限于滑动窗口中的帧。
        */
-
-      /* FIXME:这里的两个操作具体是什么目的不明白 */
       marginalization_info->preMarginalize();
       marginalization_info->marginalize();
 
-      /* 把第i帧的状态变量挪到第j帧 */
+      /**
+       * @brief 边缘化第五步：更新边缘变量，用于下一周期防止优化脱节，主要是下面两个：
+       * last_marginalization_info保存本周期滑动窗口中除第0帧之外所有帧对应参数块的优化结果，如果滑动窗口长度是2，则
+       * 保存第1帧（即第j帧）对应参数块的优化结果。
+       * last_marginalization_parameter_blocks保存本周期第j帧参数块在下一周期即第i帧对应的参数块地址，即
+       * para_PR[0]和para_VBias[0]的地址。如果滑动窗口长度是n，则应该保存n-1帧参数块在下一周期对应的参数块地址。
+       */
+
+      /** 计算本周期第1帧~第n-1帧（滑动窗口长度为n）参数块在下一周期对应参数块的地址，即第0帧~第n-2帧参数快的地址 */
       std::unordered_map<long, double *> addr_shift;
       for (int i = 1; i < SLIDEWINDOWSIZE; i++)
       {
+        /* 将para_PR[i]的地址转成整形作为map的index，将para_PR[i - 1]的地址作为map的value */
+        /* 即用第j帧的地址去索引第i帧的地址 */
         addr_shift[reinterpret_cast<long>(para_PR[i])] = para_PR[i - 1];
         addr_shift[reinterpret_cast<long>(para_VBias[i])] = para_VBias[i - 1];
       }
       
-      /* 更新last_marginalization_info，准备下一轮优化*/
+      /** 
+       * getParameterBlocks返回本周期第1帧~第n-1帧参数块在下一周期对应的参数块地址，即第0帧~第n-2帧参数块的地址，
+       * 并将这些帧参数块在本周期优化的结果保存在marginalization_info->keep_block中，用于下一周期构造防止优化脱
+       * 节的代价函数或因子。
+       */
       std::vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
       delete last_marginalization_info;
       last_marginalization_info = marginalization_info;
+      /* 将第i帧参数块para_PR[0]和para_VBias[0]的地址添加到last_marginalization_parameter_blocks中 */
       last_marginalization_parameter_blocks = parameter_blocks;
       break;
     }

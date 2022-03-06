@@ -14,9 +14,21 @@ const int NUM_THREADS = 4;
  */
 struct ResidualBlockInfo
 {
+	/**
+	 * @brief Construct a new Residual Block Info object
+	 *        构造一个新的残差块块信息对象
+	 * @param _cost_function 代价函数，或说边缘化因子
+	 * @param _loss_function 鲁邦核函数指针
+	 * @param _parameter_blocks 参数块，即para_PR或para_VBias
+	 * @param _drop_set 需要丢弃的参数块序号
+	 */
 	ResidualBlockInfo(ceres::CostFunction *_cost_function, ceres::LossFunction *_loss_function, std::vector<double *> _parameter_blocks, std::vector<int> _drop_set)
 					: cost_function(_cost_function), loss_function(_loss_function), parameter_blocks(std::move(_parameter_blocks)), drop_set(std::move(_drop_set)) {}
 
+	/**
+	 * @brief 对残差块进行优化
+	 * 
+	 */
 	void Evaluate(){
 		residuals.resize(cost_function->num_residuals());
 
@@ -31,6 +43,7 @@ struct ResidualBlockInfo
 		}
 		cost_function->Evaluate(parameter_blocks.data(), residuals.data(), raw_jacobians);
 
+		/* 使用鲁棒核函数对残差的比例进行调节，防止错误的测量值带偏优化结果 */
 		if (loss_function)
 		{
 			double residual_scaling_, alpha_sq_norm_;
@@ -66,8 +79,8 @@ struct ResidualBlockInfo
 
 	ceres::CostFunction *cost_function;
 	ceres::LossFunction *loss_function;
-	std::vector<double *> parameter_blocks;
-	std::vector<int> drop_set;
+	std::vector<double *> parameter_blocks; /* 参数块 */
+	std::vector<int> drop_set; /* 要丢弃的参数块 */
 
 	double **raw_jacobians{};
 	std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> jacobians;
@@ -89,6 +102,7 @@ struct ThreadsStruct
 void* ThreadsConstructA(void* threadsstruct);
 
 /** \brief marginalization infomation
+ *         边缘化信息
  */
 class MarginalizationInfo
 {
@@ -107,7 +121,15 @@ public:
 		}
 	}
 
+	/**
+	 * @brief 添加残差块信息（即因子）到边缘化中
+	 *        将新增参数块的size添加到parameter_block_sizes中
+	 *        将丢弃参数块的索引从parameter_block_idx中清除
+	 * @param residual_block_info 待添加的残差块信息，即因子
+	 */
 	void addResidualBlockInfo(ResidualBlockInfo *residual_block_info){
+
+		/* 添加因子到factors中 */
 		factors.emplace_back(residual_block_info);
 
 		std::vector<double *> &parameter_blocks = residual_block_info->parameter_blocks;
@@ -115,57 +137,137 @@ public:
 
 		for (int i = 0; i < static_cast<int>(residual_block_info->parameter_blocks.size()); i++)
 		{
+			/**
+			 * 以参数块的地址为key，参数块的大小为value，初始化parameter_block_size。
+			 * 由于使用参数块的地址作为key，因此即使本函数被调用很多次，相同的参数块也不会被重复添加。
+			 * 通过多次调用本函数，最终添加的参数块只有本周期的第i帧和第j帧参数块，总共四个参数块，即：
+			 * para_PR[0]、para_VBias[0]、para_PR[1]、para_VBias[1]。
+			 * 
+			 * 为什么这里添加参数块的时候只添加到了parameter_block_sizes，而没有同步添加到parameter_block_idx？
+			 * 因为提前添加到parameter_block_idx中表示该参数块被将被丢弃，将不会进入下一周期优化。
+			 * 
+			 * 在marginalize()中会将所有参数块的索引更新到parameter_block_idx中，并区分提前添加和后来添加。
+			 */
 			double *addr = parameter_blocks[i];
 			int size = parameter_block_sizes[i];
 			parameter_block_size[reinterpret_cast<long>(addr)] = size;
 		}
 
+		/* 如果参数块中有需要丢弃的，则进行丢弃操作 */
 		for (int i = 0; i < static_cast<int>(residual_block_info->drop_set.size()); i++)
 		{
+			/** 将需要丢弃的参数块提前添加到parameter_block_idx中，这些参数块将不会进入下一周期优化。
+			 * drop_set中记录了parameter_blocks中要丢弃的参数块的序号，主要是本周期的第i帧，即
+			 * para_PR[0]和para_VBias[0]，在这里被提前添加到parameter_block_idx中。
+			 * 在marginalize()中将首先遍历提前添加到parameter_block_idx中的参数块，建立索引，并用m
+			 * 变量记录提前添加参数块的结束位置，然后把parameter_block_size中其余的参数块，主要是本
+			 * 周期的第j帧，即para_PR[1]和para_VBias[1]也添加到parameter_block_idx中。
+			 * 在getParameterBlocks()中将只提取m变量之后的添加的参数块，从而达到丢弃drop_set中指定参
+			 * 数块的目的。
+			 */
+			/* parameter_block_idx是map类型，存储是乱序的，索引是parameter_blocks中参数块的地址 */
 			double *addr = parameter_blocks[residual_block_info->drop_set[i]];
 			parameter_block_idx[reinterpret_cast<long>(addr)] = 0;
 		}
 	}
 
+	/**
+	 * @brief 预边缘化
+	 *        遍历所有因子及其参数块
+	 *        将新增的参数块添加到parameter_block_data中
+	 *        parameter_block_data中的参数块都重新分配了空间，参数块的地址已经发生变化
+	 */
 	void preMarginalize(){
+
+		/* 遍历所有的因子 */
 		for (auto it : factors)
 		{
+			/* 对该因子进行优化，获得残差 */
 			it->Evaluate();
 
+			/* 遍历该因子中的所有参数块 */
 			std::vector<int> block_sizes = it->cost_function->parameter_block_sizes();
 			for (int i = 0; i < static_cast<int>(block_sizes.size()); i++)
 			{
+				/* 取得当前参数块的地址 */
 				long addr = reinterpret_cast<long>(it->parameter_blocks[i]);
 				int size = block_sizes[i];
+				/* 在parameter_block_data中查找该参数块 */
 				if (parameter_block_data.find(addr) == parameter_block_data.end())
 				{
+					/* 没找到该参数块，则添加该参数块到parameter_block_data中 */
+					/** FIXME: 这里已经为参数块重新分配了空间，地址已经发生变化，但是添加到parameter_block_data
+					 * 时用的仍然是旧的地址，为什么不用新的地址？ */
 					double *data = new double[size];
 					memcpy(data, it->parameter_blocks[i], sizeof(double) * size);
 					parameter_block_data[addr] = data;
+					/**
+					 * @brief 经过打印数据分析：每处理一帧点云，这里会添加四个参数块到parameter_block_data中，即：
+					 * para_PR[0],para_PR[1],para_VBias[0],para_VBias[1]，parameter_block_data的总长度最大就是4。
+					 */
 				}
 			}
 		}
 	}
 
+    /**
+     * @brief 边缘化
+     *        更新parameter_block_idx中的索引
+	 *        将parameter_block_size中新增的参数块的索引添加到parameter_block_idx中
+     */
 	void marginalize(){
+
+		/** 
+		 * parameter_block_idx索引的参数块总是只有四个：para_PR[0]、para_VBias[0]、para_PR[1]、para_VBias[1]，
+		 * 存放顺序以及对应的索引分别是：
+		 *  序号	参数块			size	索引	索引16进制
+		 * 	0		para_VBias[0]	9		0		0x0
+		 *  1		para_PR[0]		6		9		0x9
+		 *  2		para_VBias[1]	9		15		0xf
+		 *  3		para_PR[1]		6		24		0x18
+		 * 
+		 * 下面首先遍历提前添加到parameter_block_idx中的参数块，也就是para_VBias[0]和para_PR[0]，这两个参数块在本轮
+		 * 边缘化后将被丢弃，结束位置用变量m标识。
+		 */
+		/* 按照parameter_block_idx的参数块顺序，索引从0开始，每个参数块的索引等于parameter_block_idx中位于该参数块之前的所有参数块的size之和 */
 		int pos = 0;
 		for (auto &it : parameter_block_idx)
 		{
-			it.second = pos;
-			pos += parameter_block_size[it.first];
+			/* 将参数块的索引修改为pos，pos是前面所有参数块的size之和 */
+			it.second = pos; //second表示map容器的value，将参数块的索引设置为pos
+			pos += parameter_block_size[it.first]; //first表示map容器的key，即参数块的地址，获得当前参数块的size，累加到pos上，变成下一个参数块的索引
+			/**
+			 * @brief 经过打印数据分析：parameter_block_idx中既有的参数块总是只有para_PR[0]和para_VBias[0]，参数块数量为2
+			 */
 		}
 
+		/**
+		 * m等于parameter_block_idx中既有参数块的size之和，即结束位置，即新增参数块的起始索引
+		 * m变量记录了一个位置，在这个位置之前的参数块是需要丢弃的，之后的参数块是需要保留的 
+		 */
 		m = pos;
 
+		/**
+		 * 遍历parameter_block_size中的参数块，然后将parameter_block_size中的其余参数块添加到parameter_block_idx中，
+		 * 也就是para_VBias[1]和para_PR[1]，
+		 */
 		for (const auto &it : parameter_block_size)
 		{
+			/* 如果在parameter_block_idx中找不到该参数块的索引 */
 			if (parameter_block_idx.find(it.first) == parameter_block_idx.end())
 			{
+				/* 则添加该参数块的索引到parameter_block_idx中 */
 				parameter_block_idx[it.first] = pos;
+				/* 更新索引 */
 				pos += it.second;
+				/**
+				 * @brief 经过打印数据分析：parameter_block_idx在此处新增的参数块总是只有para_PR[1]和para_VBias[1]，
+				 * 新增后的总长度为4。
+				 */
 			}
 		}
 
+		/* n等于此次新增参数块的size之和，即所有参数块的结束位置 */
 		n = pos - m;
 
 		Eigen::MatrixXd A(pos, pos);
@@ -225,49 +327,98 @@ public:
 		linearized_residuals = S_inv_sqrt.asDiagonal() * saes2.eigenvectors().transpose() * b;
 	}
 
+	/**
+	 * @brief Get the Parameter Blocks object
+	 *  将新增的两个参数块，即第j帧的para_PR[1]和para_VBias[1]，添加到keep_block中，然后返回该帧在下一周期的
+	 *  参数块地址，即para_PR[0]和para_VBias[0]的地址。
+	 * 
+	 *  将本周期第j帧参数块的副本（即优化结果）保存到keep_block中，添加到边缘化中，然后参与到下一周期的优化中，
+	 *  并返回本周第j帧（即下一周期第i帧）在下一周期对应的参数块即para_PR[0]和para_VBias[0]地址。
+	 * 
+	 *  在下一周期的优化中，将会调用MarginalizationFactor::Evaluate()方法进行优化，优化的方法是求本周期第j帧
+	 *  （即下一周期第i帧）在下一周期优化后的结果与本周期优化后的结果（保存在keep_block中）之间的残差。
+	 * 
+	 *  本函数表面上看起来返回的是本周期第i帧即para_PR[0]和para_VBias[0]的地址，但实际上返回的是本周期第j帧
+	 * （即下一周期第i帧）在下一周期对应的参数块地址。
+	 * 
+	 * @param addr_shift 从本周期第j帧参数块地址到该帧在下一周期即第i帧对应参数块地址之间的转换关系
+	 * @return std::vector<double *> 返回本周期第i帧在下一周期对应参数块的地址
+	 */
 	std::vector<double *> getParameterBlocks(std::unordered_map<long, double *> &addr_shift){
 		std::vector<double *> keep_block_addr;
 		keep_block_size.clear();
 		keep_block_idx.clear();
 		keep_block_data.clear();
 
+		/* 遍历parameter_block_idx中记录的参数块索引 */
 		for (const auto &it : parameter_block_idx)
 		{
+			/* 检查是否是新增的参数块索引 */
 			if (it.second >= m)
 			{
+				/* 将新增参数块的size、索引、数据、地址添加到keep_block中 */
+				/** FIXME: 为什么本函数返回的是para_PR[0]和para_VBias[0]的地址，而不是参数块的真实地址 */
 				keep_block_size.push_back(parameter_block_size[it.first]);
 				keep_block_idx.push_back(parameter_block_idx[it.first]);
 				keep_block_data.push_back(parameter_block_data[it.first]);
 				keep_block_addr.push_back(addr_shift[it.first]);
+				/**
+				 * @brief 经打印分析，添加到keep_block中的总是para_PR[1]和para_VBias[1]两个参数块，即第j帧的参数块，
+				 * size分别是6和9，索引分别是0x18和0xf，addr_shift分别是para_PR[0]和para_VBias[0]的地址，即第i帧地址
+				 */
 			}
 		}
 		sum_block_size = std::accumulate(std::begin(keep_block_size), std::end(keep_block_size), 0);
 
+		/* 返回第i帧参数块para_PR[0]和para_VBias[0]的地址 */
 		return keep_block_addr;
 	}
 
+	/* 保存参与到边缘化的所有因子 */
 	std::vector<ResidualBlockInfo *> factors;
+	
+	/* 用于标识本周期丢弃和保留参数块分界线的变量 */
+	/* m之前是要丢弃的，m和n之间是要留到下一周期的参数块 */
 	int m, n;
-	std::unordered_map<long, int> parameter_block_size;
+	
+	/* 缓存本周期边缘化参数块的变量 */
+	std::unordered_map<long, int> parameter_block_size; //key是参数块的地址，value是参数块的大小
 	int sum_block_size;
-	std::unordered_map<long, int> parameter_block_idx;
+	std::unordered_map<long, int> parameter_block_idx;  //key是参数块的地址，value是参数块的索引
 	std::unordered_map<long, double *> parameter_block_data;
 
+	/* keep_block保存本周期第j帧参数块优化后的结果，用于下一周期的优化 */
 	std::vector<int> keep_block_size;
 	std::vector<int> keep_block_idx;
 	std::vector<double *> keep_block_data;
 
+	/* 用于实现边缘化的雅可比 */
 	Eigen::MatrixXd linearized_jacobians;
 	Eigen::VectorXd linearized_residuals;
 	const double eps = 1e-8;
 
 };
 
-/** \brief Ceres Cost Funtion Used for Marginalization
+/** \brief 定义防止同一个节点（一帧点云）的多次优化结果之间脱节的代价函数（因子）
+ *  
+ * 定义了一个新的代价函数，该代价函数的作用是确保下一周期的优化结果不要偏离上一周期的优化结果，
+ * 不要出现过大的偏差。
+ * 
+ * 上一周期第j帧的优化结果被保存在marginalization_info中，然后求本周期第i帧（即上一周期第j帧）
+ * 优化后的结果与上一周期优化后的结果之间的残差，确保本周优化后的结果不会过于偏离上一周期的结果。
+ * 
+ * 由于上一周期第j帧和下一个周期第i帧指向同一帧点云，即同一个节点，该节点至少要参与两次优化，具
+ * 体的优化次数取决于滑动窗口的大小，那么该代价函数的作用就是防止同一个节点的状态在每次优化前后
+ * 出现过大的偏差，防止后一次优化的结果与前一次优化的结果脱节。
  */
 class MarginalizationFactor : public ceres::CostFunction
 {
 public:
+
+	/**
+	 * @brief 构造防止同一个节点的多次优化结果之间脱节的代价函数（因子）
+	 * @param _marginalization_info 保存有上一周期优化结果的边缘化信息
+	 */
 	explicit MarginalizationFactor(MarginalizationInfo* _marginalization_info):marginalization_info(_marginalization_info){
 		int cnt = 0;
 		for (auto it : marginalization_info->keep_block_size)
@@ -278,9 +429,27 @@ public:
 		set_num_residuals(marginalization_info->n);
 	};
 
+	/**
+	 * @brief 代价函数的具体实现，定义了残差并求解
+	 * 
+	 * 该代价函数的作用是防止同一个节点（一帧点云）前后两次的优化结果之间脱节。残差公式非常简单，就是
+	 * 求前后两次优化结果的差，然后乘以雅可比获得增量，叠加到既有的残差上，最后更新雅可比。
+	 * 
+	 * FIXME: 这里残差以及雅可比的更新算法还需要进一步分析。
+	 * 
+	 * @param parameters 下一周期（或者说本周期）第i帧的优化后结果
+	 * @param residuals 残差
+	 * @param jacobians 雅可比
+	 * @return true 总是返回true
+	 */
 	bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override{
 		int n = marginalization_info->n;
 		int m = marginalization_info->m;
+
+		/** 
+		 * 求上一周期优化结果和本周期优化结果之差，上一周期的优化结果保存在marginalization_info->keep_block中，
+		 * 本周期的优化结果通过参数parameters获得。
+		 */
 		Eigen::VectorXd dx(n);
 		for (int i = 0; i < static_cast<int>(marginalization_info->keep_block_size.size()); i++)
 		{
@@ -288,14 +457,25 @@ public:
 			int idx = marginalization_info->keep_block_idx[i] - m;
 			Eigen::VectorXd x = Eigen::Map<const Eigen::VectorXd>(parameters[i], size);
 			Eigen::VectorXd x0 = Eigen::Map<const Eigen::VectorXd>(marginalization_info->keep_block_data[i], size);
+			/* 求参数块的残差 */
 			if(size == 6){
+				/* 该参数块是位置和姿态，前三个是位置，后三个是姿态，即para_PR */
 				dx.segment<3>(idx + 0) = x.segment<3>(0) - x0.segment<3>(0);
 				dx.segment<3>(idx + 3) = (Sophus::SO3d::exp(x.segment<3>(3)).inverse() * Sophus::SO3d::exp(x0.segment<3>(3))).log();
 			}else{
+				/* 该参数块是速度和偏差，即para_VBias */
 				dx.segment(idx, size) = x - x0;
 			}
+			/**
+			 * @brief 经过打印分析，这里的m总是等于0xf，marginalization_info->keep_block_idx[i]中总是只有两个索引：0xf和0x18；
+			 *        idx的值总是0x0和0x9
+			 */
 		}
+		
+		/* 更新残差 */
 		Eigen::Map<Eigen::VectorXd>(residuals, n) = marginalization_info->linearized_residuals + marginalization_info->linearized_jacobians * dx;
+		
+		/* 更新雅可比 */
 		if (jacobians)
 		{
 
@@ -357,6 +537,9 @@ struct Cost_NavState_PRV_Bias
     	/* 获得速度Vi和偏差增量dbgi、dbai */
 		Eigen::Map<const Eigen::Matrix<T, 9, 1>> velobiasi(velobiasi_);
 		Eigen::Matrix<T, 3, 1> Vi = velobiasi.template segment<3>(0);
+		/* 偏差增量 = 新的偏差 - 旧的偏差 */
+		/* 新的偏差是待优化的变量，旧的偏差来自上一轮优化的结果，如果这是第一次优化，则旧的偏差等于0 */
+		/* 每一轮优化后，新的偏差都会被更新到lidarFrame中，成为下一轮优化中的“旧的偏差” */
 		Eigen::Matrix<T, 3, 1> dbgi = velobiasi.template segment<3>(3) - imu_measure.GetBiasGyr().cast<T>();
 		Eigen::Matrix<T, 3, 1> dbai = velobiasi.template segment<3>(6) - imu_measure.GetBiasAcc().cast<T>();
     	/* 获得速度Vj */
@@ -416,8 +599,9 @@ struct Cost_NavState_PRV_Bias
 
 		/**
 		 * @brief 第三步：残差左乘信息矩阵
-		 *  -所谓信息矩阵是指IMU预积分测量噪声协方差矩阵的平方根
-		 *  -协方差矩阵的平方根通过对协方差矩阵进行Cholesky分解获得，下三角矩阵L即是原矩阵的平方根
+		 *  -所谓信息矩阵是指IMU预积分测量噪声协方差矩阵的逆矩阵的平方根
+		 *  -协方差矩阵的逆矩阵相当于取了方差的倒数，方差越大，权重越小，反之权重越大
+		 *  -逆矩阵的平方根通过对协方差矩阵进行Cholesky分解获得，下三角矩阵L即是原矩阵的平方根
 		 *  -在残差上左乘信息矩阵能够起到平衡权重的作用。优化过程中误差只是减少并不是完全消除，不能消除的误差去哪里呢？
 		 *  -当然是每条边（因子图）分摊了，但是每条边都分摊一样多的误差显然是不科学的，这个时候就需要信息矩阵，它表达
 		 *   了每条边要分摊的误差比例。
@@ -750,6 +934,7 @@ struct Cost_Initial_G
 
 /** \brief Ceres Cost Funtion of IMU Factor in LIO Initialization
  *  @brief IMU预积分代价函数
+ *   主要目的是获得精确的重力加速度方向，此外获得每帧的精确速度和整体偏差
  *  @param measure_ 当前帧的IMUIntegrator，从中获得IMU测量值
  *  @param ri_ 第i帧的姿态
  *  @param rj_ 第j帧的姿态
@@ -769,6 +954,16 @@ struct Cost_Initial_G
 									dp(dp_),
 									sqrt_information(std::move(sqrt_information_)){}
 
+/**
+ * @brief IMU预积分初始化代价函数，主要目的是获得精确的重力加速度方向，此外获得每帧的精确速度和整体偏差
+ * @tparam T 
+ * @param rwg_ 重力加速度方向
+ * @param vi_  第i帧的初始速度
+ * @param vj_  第j帧的初始速度
+ * @param ba_  待优化的加速度计偏差
+ * @param bg_  待优化的角速度计偏差
+ * @param residual 残差
+ */
 	template <typename T>
 	bool operator()(const T *rwg_, const T *vi_, const T *vj_, const T *ba_, const T *bg_, T *residual) const {
 		Eigen::Matrix<T, 3, 1> G_I{T(0), T(0), T(-9.805)};
@@ -776,6 +971,9 @@ struct Cost_Initial_G
     /* 获得偏差增量dbgi、dbai */
 		Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba(ba_);
 		Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg(bg_);
+		/* 偏差增量=新的偏差-旧的偏差 */
+		/* 新的偏差是待优化的变量，而旧的偏差来自点云到地图的匹配，如果这是第一次优化，则旧的偏差等于0 */
+		/* 每一轮优化后，新的偏差都会被更新到lidarFrame中，成为下一轮优化中的“旧的偏差” */
 		Eigen::Matrix<T, 3, 1> dbg = bg - imu_measure.GetBiasGyr().cast<T>();
 		Eigen::Matrix<T, 3, 1> dba = ba - imu_measure.GetBiasAcc().cast<T>();
 		
@@ -834,9 +1032,15 @@ struct Cost_Initial_G
 		eResiduals.template segment<3>(3) = rPhiij;
 		eResiduals.template segment<3>(6) = rVij;
 
-    /* FIXME:这里为什么要用信息矩阵去左乘残差不明白 */
-    /* 这里的sqrt_information就是对IMU预积分测量噪声的协方差矩阵的逆矩阵进行Cholesky分解，然后获得的L矩阵的转置 */
-    /* Cholesky分解本质上是对矩阵进行开方，下三角矩阵L即是原矩阵的平方根 */
+		/**
+		 * @brief 第三步：残差左乘信息矩阵
+		 *  -所谓信息矩阵是指IMU预积分测量噪声协方差矩阵的逆矩阵的平方根
+		 *  -协方差矩阵的逆矩阵相当于取了方差的倒数，方差越大，权重越小，反之权重越大
+		 *  -逆矩阵的平方根通过对协方差矩阵进行Cholesky分解获得，下三角矩阵L即是原矩阵的平方根
+		 *  -在残差上左乘信息矩阵能够起到平衡权重的作用。优化过程中误差只是减少并不是完全消除，不能消除的误差去哪里呢？
+		 *  -当然是每条边（因子图）分摊了，但是每条边都分摊一样多的误差显然是不科学的，这个时候就需要信息矩阵，它表达
+		 *   了每条边要分摊的误差比例。
+		 */
 		eResiduals.applyOnTheLeft(sqrt_information.template cast<T>());
 
 		return true;

@@ -187,14 +187,16 @@ void RemoveLidarDistortion(pcl::PointCloud<PointType>::Ptr& cloud,
 }
 
 /** @brief 进行位姿的初始化，获得重力加速度的方向，IMU的偏差等
-  *   1.在初始化之前，应该有三帧扫描点云完成了到Map的位姿优化
-  *   2.计算重力加速度的初始方向
-  *   3.以三帧点云的优化位姿和IMU的预积分位姿为残差，求得重力加速度的方向，以及IMU的偏差
-  *   4.基于优化后的IMU偏差，对三帧扫描点云之间的IMU数据重新进行预积分
+  *   1.在初始化之前，应该有128帧扫描点云完成了到Map的位姿优化
+  *   2.经过合并筛选，lidarFrameList中保存有20帧点云完成了到Map的位姿优化
+  *   2.根据第一帧点云对应的IMU加速度均值估计重力加速度的初始方向
+  *   3.以20帧点云的优化位姿（估计值）和IMU的预积分位姿（测量值）为残差，求得重力加速度的方向，初始速度以及IMU的偏差
+  *   4.基于优化后的IMU偏差，对20帧扫描点云对应的IMU数据重新进行预积分
+  *   5.将lidarFrameList的规模压缩到2帧，即滑动窗口的尺寸大小
   */
 bool TryMAPInitialization() {
 
-  /* 获得起始帧对应的加速度均值 */
+  /* 获得起始帧对应的加速度均值，仅仅是第一帧点云对应的加速度均值 */
   Eigen::Vector3d average_acc = -lidarFrameList->begin()->imuIntegrator.GetAverageAcc();
   double info_g = std::fabs(9.805 - average_acc.norm());
   /* 加速度均值归一化，再乘以重力加速度 */
@@ -225,7 +227,7 @@ bool TryMAPInitialization() {
   ceres::Solver::Summary summary_quat;
   ceres::Solve(options_quat, &problem_quat, &summary_quat);
 
-  /* 取得重力加速度方向 */
+  /* 取得初始的重力加速度方向 */
   Eigen::Quaterniond q_wg(para_quat[0], para_quat[1], para_quat[2], para_quat[3]);
 
   /* 定义状态变量的初始值，偏差为0 */
@@ -234,7 +236,7 @@ bool TryMAPInitialization() {
   Eigen::Vector3d prior_ba = Eigen::Vector3d::Zero();
   Eigen::Vector3d prior_bg = Eigen::Vector3d::Zero();
   std::vector<Eigen::Vector3d> prior_v;
-  int v_size = lidarFrameList->size(); //应该有三帧点云
+  int v_size = lidarFrameList->size(); //应该有20帧点云
   for(int i = 0; i < v_size; i++) {
     prior_v.push_back(Eigen::Vector3d::Zero());
   }
@@ -242,7 +244,7 @@ bool TryMAPInitialization() {
   Sophus::SO3d SO3_R_wg(q_wg.toRotationMatrix());
   prior_r = SO3_R_wg.log();
   
-  /* 求每帧对应的初始速度prior_v */
+  /* 根据没两帧的位置P之差求每帧对应的初始速度prior_v */
   for (int i = 1; i < v_size; i++){
     auto iter = lidarFrameList->begin();
     auto iter_next = lidarFrameList->begin();
@@ -255,6 +257,7 @@ bool TryMAPInitialization() {
   prior_v[0] = prior_v[1];
 
   /* 定义待优化的状态变量，包括速度、姿态、偏差 */
+  /* 注意：只有速度是每帧一份，姿态和偏差总共只有一份 */
   double para_v[v_size][3];
   double para_r[3];
   double para_ba[3];
@@ -310,6 +313,8 @@ bool TryMAPInitialization() {
                              para_v[i]);
   }
 
+  /* 对lidarFrameList中的20帧点云逐一构造IMU预积分代价函数，添加到残差，进行整体优化 */
+  /* 优化的基础来这20帧点云都已经进行了逐帧到Map的匹配优化，获得了初始的位姿，通过优化获得更加精确的重力加速度方向 */
   for(int i = 1; i < v_size; i++) {
     auto iter = lidarFrameList->begin();
     auto iter_next = lidarFrameList->begin();
@@ -366,6 +371,7 @@ bool TryMAPInitialization() {
   }
 
   /* 用优化后的偏差和速度来更新点云帧列表lidarFrameList */
+  /* 注意：这里对20帧数据优化后获得一个统一的偏差，作为初始值更新到每一帧点云中 */
   for(int i = 0; i < v_size; i++) {
     auto iter = lidarFrameList->begin();
     std::advance(iter, i);
@@ -639,8 +645,8 @@ void process(){
             pubFullLaserCloud.publish(laserCloudMsg);
 
             /*****************************************************************\
-             * 如果是紧耦合IMU模式，并且尚未初始化，则进行初始化
-             * 
+             * 如果是紧耦合IMU模式，并且尚未初始化，则进行初始化，获得准确的重力加速
+             * 度方向、初始的速度以及IMU的测量偏差
             \*****************************************************************/  
 
             /* 如果是紧耦合IMU模式，并且尚未初始化，则进行初始化 */
