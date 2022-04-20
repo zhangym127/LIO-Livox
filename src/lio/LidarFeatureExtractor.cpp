@@ -673,7 +673,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
 /**
  * @brief 包含点云分割的特征提取，分割的主要目的是剔除不是背景的点云
  * @param msg 订阅的消息，包含原始点云
- * @param laserCloud 输出参数，完整点云
+ * @param laserCloud 输出参数，完整点云，其中每个点的normal_z表征点的特征类型：角点、平面、不规则
  * @param laserConerFeature 输出参数，角点特征点云
  * @param laserSurfFeature 输出参数，平面点特征点云
  * @param laserNonFeature 输出参数，不规则特征点云
