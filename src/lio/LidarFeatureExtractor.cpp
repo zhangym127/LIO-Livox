@@ -172,8 +172,8 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
     double angle_next = (pt_next-pt_cur).dot(pt_cur) / ((pt_next-pt_cur).norm()*pt_cur.norm());
  
     /* 如果距离大于100米，或者夹角α和β都小于15°或大于165° */
-	/* 夹角α和β都小于15°或大于165°说明相邻两点L和N的深度都比C更大 */
-	/* 这里说的L和N比C更远指的是从坐标原点O算起L和N比C更远，或者说OL和ON比OC更长，下面注释中的远近都指的是这个意思 */
+	  /* 夹角α和β都小于15°或大于165°说明相邻两点L和N的深度都比C更大 */
+	  /* 这里说的L和N比C更远指的是从坐标原点O算起L和N比C更远，或者说OL和ON比OC更长，下面注释中的远近都指的是这个意思 */
     if (dis > thDistanceFaraway || (fabs(angle_last) > 0.966 && fabs(angle_next) > 0.966)) {
       thNumCurvSize = 2;
     } else {
@@ -258,10 +258,10 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
 
       if (cloudCurvature[ind] < thFlatThreshold * cloudDepth[ind] * thFlatThreshold * cloudDepth[ind]) {
         
-		/* 将曲率小于阈值的点暂列为候选特征点 */
+		    /* 将曲率小于阈值的点暂列为候选特征点 */
         CloudFeatureFlag[ind] = 3;
 
-		/* 如果当前点的相邻点与其相邻点的距离很近，并且距离小于100米，则丢弃该点 */
+		    /* 如果当前点的相邻点与其相邻点的距离很近，并且距离小于100米，则丢弃该点 */
         for (int l = 1; l <= thNumCurvSize; l++) {
           float diffX = _laserCloud->points[ind + l].x -
                         _laserCloud->points[ind + l - 1].x;
@@ -327,15 +327,15 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
   /* 4.当两侧方向向量夹角在60~120度之间，且当前点到两侧第4点的距离＞0.05，则认定为角点 */
   for (int i = 5; i < cloudSize - 5; i += count_num ) {
 	  
-	/* 求当前点到坐标原点O的距离 */ 
+	  /* 求当前点到坐标原点O的距离 */ 
     float depth = sqrt(_laserCloud->points[i].x * _laserCloud->points[i].x +
                        _laserCloud->points[i].y * _laserCloud->points[i].y +
                        _laserCloud->points[i].z * _laserCloud->points[i].z);
     /* 求左侧曲率 */
-	/* 去包含当前点C以及左右两侧相邻的各四个点： */
-	/* L4 L3 L2 L1 C R1 R2 R3 R4 */
-	/* 然后分别求L2和R2的曲率，作为左侧曲率和右侧曲率 */
-	//left curvature
+	  /* 取包含当前点C以及左右两侧相邻的各四个点： */
+	  /* L4 L3 L2 L1 C R1 R2 R3 R4 */
+	  /* 然后分别求L2和R2的曲率，作为左侧曲率和右侧曲率 */
+	  //left curvature
     float ldiffX =
             _laserCloud->points[i - 4].x + _laserCloud->points[i - 3].x
             - 4 * _laserCloud->points[i - 2].x
@@ -353,7 +353,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
 
     float left_curvature = ldiffX * ldiffX + ldiffY * ldiffY + ldiffZ * ldiffZ;
 
-	/* 如果左侧曲率小于阈值，则设置左侧是平面的标志 */
+	  /* 如果左侧曲率小于阈值，则设置左侧是平面的标志 */
     if(left_curvature < thFlatThreshold * depth){
 
       /* FIXME:下面这个局部vector压入操作似乎没有意义，后面并没有使用 */
@@ -418,7 +418,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
         tmp.normalize();
         norm_left += (k/10.0)* tmp;
       }
-	  /* 求从当前点到右侧4个点的方向向量均值 */
+	    /* 求从当前点到右侧4个点的方向向量均值 */
       for(int k = 1;k<5;k++){
         Eigen::Vector3d tmp = Eigen::Vector3d(_laserCloud->points[i + k].x - _laserCloud->points[i].x,
                                               _laserCloud->points[i + k].y - _laserCloud->points[i].y,
@@ -427,11 +427,11 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
         norm_right += (k/10.0)* tmp;
       }
       
-	  /* 求左右两个方向向量的夹角的余弦 */
+	    /* 求左右两个方向向量的夹角的余弦 */
       //calculate the angle between this group and the previous group
       double cc = fabs( norm_left.dot(norm_right) / (norm_left.norm()*norm_right.norm()) );
 	  
-	  /* 分别求左右两侧第四个点与当前点的距离 */
+	    /* 分别求左右两侧第四个点与当前点的距离 */
       //calculate the maximum distance, the distance cannot be too small
       Eigen::Vector3d last_tmp = Eigen::Vector3d(_laserCloud->points[i - 4].x - _laserCloud->points[i].x,
                                                  _laserCloud->points[i - 4].y - _laserCloud->points[i].y,
@@ -443,7 +443,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
       double current_dis = current_tmp.norm();
 
       /* 如果左右两个向量夹角＞60度并＜120度，且左右第四个点与当前点的距离大于0.05，
-	   * 则设定当前点的特征值为150，即确定为角点特征点 */
+	     * 则设定当前点的特征值为150，即确定为角点特征点 */
       if(cc < 0.5 && last_dis > 0.05 && current_dis > 0.05 ){ //
         debugnum5 ++;
         CloudFeatureFlag[i] = 150;
@@ -456,13 +456,13 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
     float diff_left[2];
     float diff_right[2];
 	
-	/* 求当前点到坐标原点O的距离，即深度 */
-	/* FIXME: 之前已经求过，为什么这里重复求？为什么后面没有用？ */
+	  /* 求当前点到坐标原点O的距离，即深度 */
+	  /* FIXME: 之前已经求过，为什么这里重复求？为什么后面没有用？ */
     float depth = sqrt(_laserCloud->points[i].x * _laserCloud->points[i].x +
                        _laserCloud->points[i].y * _laserCloud->points[i].y +
                        _laserCloud->points[i].z * _laserCloud->points[i].z);
 
-	/* 分别求两侧相邻的2个点与当前点的欧氏距离 */
+	  /* 分别求两侧相邻的2个点与当前点的欧氏距离 */
     for(int count = 1; count < 3; count++ ){
       float diffX1 = _laserCloud->points[i + count].x - _laserCloud->points[i].x;
       float diffY1 = _laserCloud->points[i + count].y - _laserCloud->points[i].y;
@@ -483,7 +483,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
                             _laserCloud->points[i - 1].y * _laserCloud->points[i - 1].y +
                             _laserCloud->points[i - 1].z * _laserCloud->points[i - 1].z);
     
-	/* 如果左右两侧第一个点与当前点的距离差大于1米 */
+	  /* 如果左右两侧第一个点与当前点的距离差大于1米 */
     if(fabs(diff_right[0] - diff_left[0]) > thBreakCornerDis){
       /* 如果右侧点的距离＞左侧点的距离 */
       if(diff_right[0] > diff_left[0]){
@@ -522,7 +522,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
         bool left_is_plane = plane_judge(left_list,100);
 
         /* 当∠OCL在18~162度之间，并且右侧点的深度大于左侧点的深度时，或者右侧点不存在时，
-		 * 将当前点的特征值设为100，即角点特征点将当前点的特征值设为100，即角点特征点 */
+		     * 将当前点的特征值设为100，即角点特征点 */
         if( cc < 0.95 ){//(max_dis < 2*min_dis) && left_surf_dis < 0.05 * depth  && left_is_plane &&
           if(depth_right > depth_left){
             CloudFeatureFlag[i] = 100;
@@ -534,7 +534,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
       }
       else{
 		
-		/* 当前点是C，右侧相邻点是R，坐标原点是O，求OC与CR夹角∠OCR的余弦cc */
+		    /* 当前点是C，右侧相邻点是R，坐标原点是O，求OC与CR夹角∠OCR的余弦cc */
         Eigen::Vector3d surf_vector = Eigen::Vector3d(_laserCloud->points[i + 1].x - _laserCloud->points[i].x,
                                                       _laserCloud->points[i + 1].y - _laserCloud->points[i].y,
                                                       _laserCloud->points[i + 1].z - _laserCloud->points[i].z);
@@ -562,7 +562,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
         bool right_is_plane = plane_judge(right_list,100);
 
         /* 当∠OCR在18~162度之间，并且左侧点的深度大于右侧点的深度时，或者左侧点不存在时，
-		 * 将当前点的特征值设为100，即角点特征点将当前点的特征值设为100，即角点特征点 */
+		     * 将当前点的特征值设为100，即角点特征点将当前点的特征值设为100，即角点特征点 */
         if( cc < 0.95){ //right_is_plane  && (max_dis < 2*min_dis) && right_surf_dis < 0.05 * depth &&
 
           if(depth_right < depth_left){
@@ -600,10 +600,10 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
         front_norms.push_back(tmp);
         norm_front += (k/6.0)* tmp;
       }
-	  /* 求从当前点到右侧4个点的方向向量均值，仅当右侧点到当前点的距离＞1米的才能入选 */
+	    /* 求从当前点到右侧4个点的方向向量均值，仅当右侧点到当前点的距离＞1米的才能入选 */
       std::vector<Eigen::Vector3d> back_norms;
       for(int k = 1;k<4;k++){
-		/* FIXME: 下面的代码似乎把i+k写成了i-k，存在明显错误 */
+		    /* FIXME: 下面的代码似乎把i+k写成了i-k，存在明显错误 */
         float temp_depth = sqrt(_laserCloud->points[i - k].x * _laserCloud->points[i - k].x +
                         _laserCloud->points[i - k].y * _laserCloud->points[i - k].y +
                         _laserCloud->points[i - k].z * _laserCloud->points[i - k].z);
@@ -619,7 +619,7 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
         back_norms.push_back(tmp);
         norm_back += (k/6.0)* tmp;
       }
-	  /* 求左右两个方向向量夹角的余弦cc的绝对值 */
+	    /* 求左右两个方向向量夹角的余弦cc的绝对值 */
       double cc = fabs( norm_front.dot(norm_back) / (norm_front.norm()*norm_back.norm()) );
       /* 如果夹角不在18~162度之间，则将该点的特征值设置为101，即排除在角点之外 */
       if(cc < 0.95){
@@ -648,14 +648,14 @@ void LidarFeatureExtractor::detectFeaturePoint(pcl::PointCloud<PointType>::Ptr& 
     /* 深度小于1米的点不做为特征点 */
     if(dis < thLidarNearestDis*thLidarNearestDis) continue;
 
-	/* 仅当特征值为2时才被加入平面特征点 */
+	  /* 仅当特征值为2时才被加入平面特征点 */
     if(CloudFeatureFlag[i] == 2){
       pointsLessFlat.push_back(i);
       num_surf++;
       continue;
     }
 
-	/* 仅当特征值为100或150时，才被加入角点特征点 */
+	  /* 仅当特征值为100或150时，才被加入角点特征点 */
     if(CloudFeatureFlag[i] == 100 || CloudFeatureFlag[i] == 150){ //
       pointsLessSharp_ori.push_back(i);
       laserCloudCorner->push_back(_laserCloud->points[i]);

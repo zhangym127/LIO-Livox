@@ -49,9 +49,11 @@ Estimator::~Estimator(){
   delete map_manager;
 }
 
-/** @brief 建图线程
-  *   将ForMap容器中的点云添加到Map
-  *   通过互斥信号量mtx_Map实现与EstimateLidarPose实现同步，一个消费，一个生产
+/** 
+  * @brief 建图线程，建立全局Map
+  * 
+  * 将ForMap容器中的点云添加到全局Map
+  * 通过互斥信号量mtx_Map实现与EstimateLidarPose实现同步，一个消费，一个生产
   */
 [[noreturn]] void Estimator::threadMapIncrement(){
   pcl::PointCloud<PointType>::Ptr laserCloudCorner(new pcl::PointCloud<PointType>);
@@ -114,17 +116,23 @@ Estimator::~Estimator(){
   }
 }
 
-/** @brief 对于待匹配角点特征点云中的每个点p，在Map找到最近的线特征，在线特征上构造a、b两个点，然后以点p到
-  * 直线ab的距离为优化目标，构造一个代价函数，添加到edges中。同时，直接计算点p到直线ab的距离，保存到vLineFeatures
-  * 中，如果该距离小于某个阈值，则对应的代价函数不需要优化。
-  * @param [out] edges 构造好的代价函数
-  * @param [out] vLineFeatures 线特征容器
-  * @param [in] laserCloudCorner 角点特征点云，即待匹配点云
-  * @param [in] laserCloudCornerLocal 本地Map
-  * @param [in] kdtreeLocal 用本地Map建立的KDtree
-  * @param [in] exTlb Lidar与IMU之间的外参矩阵
-  * @param [in] m4d 待匹配点云的估计位姿
-  */
+/** 
+ * @brief 构造角点特征点的代价函数
+ * 
+ * 为角点中的每个点构造两个代价函数：一个是到全局Map的残差，一个是到局部Map的残差
+ * 
+ * 对于待匹配角点特征点云中的每个点p，在Map找到最近的线特征，在线特征上构造a、b两个点，然后以点p到
+ * 直线ab的距离为优化目标，构造一个代价函数，添加到edges中。同时，直接计算点p到直线ab的距离，保存到vLineFeatures
+ * 中，如果该距离小于某个阈值，则对应的代价函数不需要优化。
+ * 
+ * @param [out] edges 构造好的代价函数
+ * @param [out] vLineFeatures 线特征容器
+ * @param [in] laserCloudCorner 角点特征点云，即待匹配点云
+ * @param [in] laserCloudCornerLocal 本地Map
+ * @param [in] kdtreeLocal 用本地Map建立的KDtree
+ * @param [in] exTlb Lidar与IMU之间的外参矩阵
+ * @param [in] m4d 待匹配点云的估计位姿
+ */
 void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
                                    std::vector<FeatureLine>& vLineFeatures,
                                    const pcl::PointCloud<PointType>::Ptr& laserCloudCorner,
@@ -168,7 +176,7 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
   int debug_num12 = 0;
   int debug_num22 = 0;
   
-  /* 为待匹配的特征点云中的每一个点构造一个代价函数添加到edges中 */
+  /* 为待匹配的特征点云中的每一个点构造两个代价函数添加到edges中，一个是全局Map，一个是局部Map */
   for (int i = 0; i < laserCloudCornerStackNum; i++) {
     /* 从待匹配点云中取一个点 */
     _pointOri = laserCloudCorner->points[i];
@@ -284,7 +292,7 @@ void Estimator::processPointToLine(std::vector<ceres::CostFunction *>& edges,
       }
     }
 
-    /* 基于当前点到本地Map的距离构造残差，构造代价函数 */
+    /* 基于当前点到局部Map的距离构造残差，构造代价函数 */
     /* 如果对应的Map规模大于20个点，则在Map中查找5个最近点，求质心，求协方差矩阵，求特征向量
      * 然后沿主方向在质心两侧构造a、b两个点，求p到ab的距离，当p位于ab中心时残差具有最小值	*/
     if(laserCloudCornerLocal->points.size() > 20 ){
@@ -532,15 +540,21 @@ void Estimator::processPointToPlan(std::vector<ceres::CostFunction *>& edges,
   }
 }
 
-/** @brief 求待匹配平面特征点云中每个点到Map的距离，为每个点构造一个代价函数
-  * @param [out] edges 构造好的代价函数
-  * @param [out] vPlanFeatures 平面特征容器
-  * @param [in] laserCloudSurf 平面特征点云，即待匹配点云
-  * @param [in] laserCloudSurfLocal 本地Map
-  * @param [in] kdtreeLocal 用本地Map建立的KDtree
-  * @param [in] exTlb Lidar与IMU之间的外参矩阵
-  * @param [in] m4d 待匹配点云的估计位姿
-  */
+/**
+ * @brief 构造平面特征点的代价函数
+ * 
+ * 为平面点中的每个点构造两个代价函数：一个是到全局Map的残差，一个是到局部Map的残差
+ * 
+ * 求待匹配平面特征点云中每个点到Map的距离，以该距离为残差构造代价函数
+ * 
+ * @param [out] edges 构造好的代价函数
+ * @param [out] vPlanFeatures 平面特征容器
+ * @param [in] laserCloudSurf 平面特征点云，即待匹配点云
+ * @param [in] laserCloudSurfLocal 本地Map
+ * @param [in] kdtreeLocal 用本地Map建立的KDtree
+ * @param [in] exTlb Lidar与IMU之间的外参矩阵
+ * @param [in] m4d 待匹配点云的估计位姿
+ */
 void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
                                    std::vector<FeaturePlanVec>& vPlanFeatures,
                                    const pcl::PointCloud<PointType>::Ptr& laserCloudSurf,
@@ -759,15 +773,21 @@ void Estimator::processPointToPlanVec(std::vector<ceres::CostFunction *>& edges,
   }
 }
 
-/** @brief 求待匹配不规则特征点云中每个点到Map的距离，为每个点构造一个代价函数
-  * @param [out] edges 构造好的代价函数
-  * @param [out] vNonFeatures 不规则特征容器
-  * @param [in] laserCloudNonFeature 不规则特征点云，即待匹配点云
-  * @param [in] laserCloudNonFeatureLocal 本地Map
-  * @param [in] kdtreeLocal 用本地Map建立的KDtree
-  * @param [in] exTlb Lidar与IMU之间的外参矩阵
-  * @param [in] m4d 待匹配点云的估计位姿
-  */
+/** 
+ * @brief 构造不规则特征点的代价函数
+ * 
+ * 为不规则特征点中的每个点构造两个代价函数：一个是到全局Map的残差，一个是到局部Map的残差
+ * 
+ * 求待匹配不规则特征点云中每个点到Map的距离，为每个点构造一个代价函数
+ * 
+ * @param [out] edges 构造好的代价函数
+ * @param [out] vNonFeatures 不规则特征容器
+ * @param [in] laserCloudNonFeature 不规则特征点云，即待匹配点云
+ * @param [in] laserCloudNonFeatureLocal 本地Map
+ * @param [in] kdtreeLocal 用本地Map建立的KDtree
+ * @param [in] exTlb Lidar与IMU之间的外参矩阵
+ * @param [in] m4d 待匹配点云的估计位姿
+ */
 void Estimator::processNonFeatureICP(std::vector<ceres::CostFunction *>& edges,
                                      std::vector<FeatureNon>& vNonFeatures,
                                      const pcl::PointCloud<PointType>::Ptr& laserCloudNonFeature,
@@ -993,7 +1013,7 @@ void Estimator::double2vector(std::list<LidarFrame>& lidarFrameList){
 /** @brief 位姿优化
   *   1、将三种特征点分开，并降采样
   *   2、进行点云匹配，获得优化后的位姿
-  *   3、将匹配后的特征点云添加到Map
+  *   3、将匹配后的特征点云添加到全局Map和局部Map
   * @param [in] lidarFrameList: 点云帧列表
   * @param [in] exTlb: 从Lidar坐标系到IMU坐标系的外参
   * @param [in] gravity: 重力加速度向量
@@ -1072,24 +1092,28 @@ void Estimator::EstimateLidarPose(std::list<LidarFrame>& lidarFrameList,
   transformTobeMapped.topLeftCorner(3,3) = lidarFrameList.front().Q * exRbl;
   transformTobeMapped.topRightCorner(3,1) = lidarFrameList.front().Q * exPbl + lidarFrameList.front().P;
 
-  /* 将完成匹配的特征点云分别添加到Map和本地Map */
+  /* 将完成匹配的特征点云分别添加到全局Map和局部Map */
   
-  /* 将降采样后的特征点云添加到ForMap容器，threadMapIncrement线程会从该容器取出点云叠加到Map中 */
+  /***    Global Map    ***/
+
+  /* 将降采样后的特征点云添加到ForMap容器，threadMapIncrement线程会从该容器取出点云叠加到全局Map中 */
   std::unique_lock<std::mutex> locker(mtx_Map);
   *laserCloudCornerForMap = *laserCloudCornerStack[0];
   *laserCloudSurfForMap = *laserCloudSurfStack[0];
   *laserCloudNonFeatureForMap = *laserCloudNonFeatureStack[0];
-  /* threadMapIncrement线程用transformForMap完成点云的变换后叠加到Map */
+  /* threadMapIncrement线程用transformForMap完成点云的变换后叠加到全局Map */
   transformForMap = transformTobeMapped;
   
-  /* 清空FromLocal容器，准备更新本地Map */
-  /* FromLocal容器存放了最近的若干帧完成坐标变换、叠加和降采样的特征点云，相当于本地地图 */
+  /***    Local Map    ***/
+
+  /* 清空FromLocal容器，准备更新局部Map */
+  /* FromLocal容器存放了最近的若干帧完成坐标变换、叠加和降采样的特征点云，相当于局部Map */
   /* 与Map的匹配就是和FromLocal中的特征点云匹配 */
   laserCloudCornerFromLocal->clear();
   laserCloudSurfFromLocal->clear();
   laserCloudNonFeatureFromLocal->clear();
-  /* 生成用于点云匹配的本地Map，存放在FromLocal容器中 */
-  /* 即将最近的若干帧特征点云变换到Map坐标系，叠加在一起，降采样后存放在FromLocal容器中 */
+  /* 生成用于点云匹配的局部Map，存放在FromLocal容器中 */
+  /* 即将最近的若干帧特征点云变换到Map坐标系，叠加在一起，降采样后存放在FromLocal容器中，构成局部Map */
   MapIncrementLocal(laserCloudCornerForMap,laserCloudSurfForMap,laserCloudNonFeatureForMap,transformTobeMapped);
   locker.unlock();
 }
@@ -1126,12 +1150,12 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
   Eigen::Matrix3d exRbl = exTlb.topLeftCorner(3,3).transpose();
   Eigen::Vector3d exPbl = -1.0 * exRbl * exTlb.topRightCorner(3,1);
 
-  /* 建立本地Map的KDtree */
+  /* 建立局部Map的KDtree */
   kdtreeCornerFromLocal->setInputCloud(laserCloudCornerFromLocal);
   kdtreeSurfFromLocal->setInputCloud(laserCloudSurfFromLocal);
   kdtreeNonFeatureFromLocal->setInputCloud(laserCloudNonFeatureFromLocal);
 
-  /* ??? */
+  /* 加载全局Map及其KDtree */
   std::unique_lock<std::mutex> locker3(map_manager->mtx_MapManager);
   for(int i = 0; i < 4851; i++){
     CornerKdMap[i] = map_manager->getCornerKdMap(i);
@@ -1301,7 +1325,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
       transformTobeMapped.topLeftCorner(3,3) = frame_curr->Q * exRbl;
       transformTobeMapped.topRightCorner(3,1) = frame_curr->Q * exPbl + frame_curr->P;
 
-      /* 启动独立线程，构造角点特征点云与Map之间的Ceres代价函数 */
+      /* 启动独立线程，构造角点特征点云与全局Map和局部Map之间的Ceres代价函数 */
       threads[0] = std::thread(&Estimator::processPointToLine, this,
                                std::ref(edgesLine[f]),
                                std::ref(vLineFeatures[f]),
@@ -1311,7 +1335,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                std::ref(exTlb),
                                std::ref(transformTobeMapped));
 
-      /* 启动独立线程，构造平面特征点云与Map之间的Ceres代价函数 */
+      /* 启动独立线程，构造平面特征点云与全局Map和局部Map之间的Ceres代价函数 */
       threads[1] = std::thread(&Estimator::processPointToPlanVec, this,
                                std::ref(edgesPlan[f]),
                                std::ref(vPlanFeatures[f]),
@@ -1321,7 +1345,7 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
                                std::ref(exTlb),
                                std::ref(transformTobeMapped));
 
-      /* 启动独立线程，构造不规则特征点云与Map之间的Ceres代价函数 */
+      /* 启动独立线程，构造不规则特征点云与全局Map和局部Map之间的Ceres代价函数 */
       threads[2] = std::thread(&Estimator::processNonFeatureICP, this,
                                std::ref(edgesNon[f]),
                                std::ref(vNonFeatures[f]),
@@ -1711,8 +1735,12 @@ void Estimator::Estimate(std::list<LidarFrame>& lidarFrameList,
 
 }
 
-/** @brief 将特征点云变换到地图坐标系，添加到FromLocal容器
-  *   本地Map每次都重新生成，只保存最近的50帧点云数据
+/** 
+  * @brief 建立局部Map
+  * 
+  *  将特征点云变换到地图坐标系，添加到FromLocal容器
+  *  本地Map每次都重新生成，只保存最近的50帧点云数据
+  * 
   * @param [in] laserCloudCornerStack: 角点特征点云
   * @param [in] laserCloudSurfStack: 平面特征点云
   * @param [in] laserCloudNonFeatureStack: 不规则特征点云
@@ -1728,6 +1756,17 @@ void Estimator::MapIncrementLocal(const pcl::PointCloud<PointType>::Ptr& laserCl
   PointType pointSel;
   PointType pointSel2;
   size_t Id = localMapID % localMapWindowSize;
+
+  /**
+   * localMapWindowSize = 50
+   * 
+   * 局部Map只保存最近的50帧点云，这里的Id总是从0~49往复循环，循环到49之后就会回到0,
+   * 新的一帧点云就会覆盖localCornerMap中既有的第0帧、第1帧、第2帧……
+   * 因此localCornerMap中总是只有50帧点云。
+   * 
+   * 最后将localCornerMap中的50帧点云叠加在一起，降采样后放到laserCloudCornerFromLocal中
+   * 构成局部地图。
+   */
   
   /* 将特征点云变换到地图坐标系 */
   localCornerMap[Id]->clear();

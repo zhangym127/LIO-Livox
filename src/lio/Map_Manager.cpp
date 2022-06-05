@@ -27,6 +27,20 @@ MAP_MANAGER::MAP_MANAGER(const float& filter_corner, const float& filter_surf){
   downSizeFilterNonFeature.setLeafSize(0.4, 0.4, 0.4);
 }
 
+/**
+ * @brief 根据cube的坐标计算出id
+ * 
+ * -------------
+ * | 2 | 5 | 8 | 
+ * -------------
+ * | 1 | 4 | 7 |  Depth(X)
+ * -------------
+ * | 0 | 3 | 6 | 
+ * -------------
+ *    Width(Y)
+ * 
+ * id的编号方式如上图所示，如果在Z轴方向有多层，则下一层的第一个编号是Depth*Width。
+ */
 size_t MAP_MANAGER::ToIndex(int i, int j, int k)  {
   return i + laserCloudDepth * j + laserCloudDepth * laserCloudWidth * k;
 }
@@ -89,6 +103,8 @@ void MAP_MANAGER::MapIncrement(const pcl::PointCloud<PointType>::Ptr& laserCloud
   clock_t t0,t1,t2,t3,t4,t5;
   t0 = clock();
   std::unique_lock<std::mutex> locker2(mtx_MapManager);
+
+  /* 将所有的全局Map添加到*_for_match中，Estimator中再通过GlobalCornerMap来访问 */
   for(int i = 0; i < laserCloudNum; i++){
     CornerKdMap_last[i] = *laserCloudCornerKdMap[i];
     SurfKdMap_last[i] = *laserCloudSurfKdMap[i];
@@ -115,6 +131,8 @@ void MAP_MANAGER::MapIncrement(const pcl::PointCloud<PointType>::Ptr& laserCloud
   bool SurfChangeFlag[laserCloudNum] = {false};
   bool NonFeatureChangeFlag[laserCloudNum] = {false};
   PointType pointSel;
+
+  
   for (int i = 0; i < laserCloudCornerStackNum; i++) {
 
     pointSel = laserCloudCornerStack->points[i];
@@ -252,8 +270,10 @@ void MAP_MANAGER::MapMove(const Eigen::Matrix4d& transformTobeMapped){
   pointOnYAxis.y = 0.0;
   pointOnYAxis.z = 10.0;
 
+  /* 将(0,0,10)变换到世界坐标系，但是变换后【并没有使用】 */
   pointAssociateToMap(&pointOnYAxis, &pointOnYAxis, transformTobeMapped);
 
+  /* 根据当前点云帧的位置，换算出Cube矩阵的新中心 */
   int centerCubeI = int((transformTobeMapped_t.x() + 25.0) / 50.0) + laserCloudCenDepth;
   int centerCubeJ = int((transformTobeMapped_t.y() + 25.0) / 50.0) + laserCloudCenWidth;
   int centerCubeK = int((transformTobeMapped_t.z() + 25.0) / 50.0) + laserCloudCenHeight;
@@ -262,15 +282,16 @@ void MAP_MANAGER::MapMove(const Eigen::Matrix4d& transformTobeMapped){
   if (transformTobeMapped_t.y() + 25.0 < 0) centerCubeJ--;
   if (transformTobeMapped_t.z() + 25.0 < 0) centerCubeK--;
 
+  /* 新中心在深度方向向后缩了，Cube矩阵要向后移动一格 */
   while (centerCubeI < 8) {
     for (int j = 0; j < laserCloudWidth; j++) {
       for (int k = 0; k < laserCloudHeight; k++) {
-        int i = laserCloudDepth - 1;
+        int i = laserCloudDepth - 1; //深度值减一
+        /* 取得深度方向最前端的一排Cube中的点云，放在临时变量中，把最前端的Cube空出来 */
         pcl::KdTreeFLANN<PointType>::Ptr laserCloudCubeCornerPointerKd =
                 laserCloudCornerKdMap[ToIndex(i, j, k)];
         pcl::KdTreeFLANN<PointType>::Ptr laserCloudCubeSurfPointerKd =
                 laserCloudSurfKdMap[ToIndex(i, j, k)];
-
         pcl::KdTreeFLANN<PointType>::Ptr laserCloudCubeNonFeaturePointerKd =
                 laserCloudNonFeatureKdMap[ToIndex(i, j, k)];
 
@@ -281,6 +302,7 @@ void MAP_MANAGER::MapMove(const Eigen::Matrix4d& transformTobeMapped){
         pcl::PointCloud<PointType>::Ptr laserCloudCubeNonFeaturePointer =
                 laserCloudNonFeatureArray[ToIndex(i, j, k)];
 
+        /* 把深度方向第i-1单元Cube的点云移动到第i单元，即点云Cube整体沿深度方向前挪一格 */
         for (; i >= 1; i--) {
           const size_t index_a = ToIndex(i, j, k);
           const size_t index_b = ToIndex(i - 1, j, k);
@@ -292,7 +314,8 @@ void MAP_MANAGER::MapMove(const Eigen::Matrix4d& transformTobeMapped){
           laserCloudSurfArray[index_a] = laserCloudSurfArray[index_b];
           laserCloudNonFeatureArray[index_a] = laserCloudNonFeatureArray[index_b];
         }
-        //此时i已经移动至0
+
+        //此时i已经移动至0，深度方向最后一排Cube空出来了，把保存临时变量中的点云放进去。
         laserCloudCornerKdMap[ToIndex(i, j, k)] = laserCloudCubeCornerPointerKd;
         laserCloudSurfKdMap[ToIndex(i, j, k)] = laserCloudCubeSurfPointerKd;
         laserCloudNonFeatureKdMap[ToIndex(i, j, k)] = laserCloudCubeNonFeaturePointerKd;
@@ -306,6 +329,7 @@ void MAP_MANAGER::MapMove(const Eigen::Matrix4d& transformTobeMapped){
       }
     }
 
+    /* 地图整体向下滚动，点云坐标原点上移 */
     centerCubeI++;
     laserCloudCenDepth++;
   }
